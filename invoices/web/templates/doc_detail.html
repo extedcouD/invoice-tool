@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}{{ d.fields.invoice_id or d.id }} — review{% endblock %}
+{% block body %}
+<p><a href="{{ url_for('review') }}">← review queue</a></p>
+<h1>{{ d.fields.invoice_id or d.id }}
+  <span class="pill {{ 'bad' if d.confidence<0.6 else 'warn' if d.confidence<0.8 else 'ok' }}">conf {{ '%.2f'|format(d.confidence) }}</span>
+  <span class="pill {{ 'warn' if d.source.value=='ocr' else 'info' }}">{{ d.source.value }}</span>
+  {% if d.reviewed %}<span class="pill ok">reviewed</span>{% endif %}
+</h1>
+<div class="muted mono" style="margin-bottom:8px">{{ d.path }}</div>
+
+{% if d.flags %}
+<div style="margin-bottom:14px">
+  {% for f in d.flags %}
+  <span class="pill {{ 'bad' if f.severity.value=='error' else 'warn' if f.severity.value=='warn' else 'info' }}"
+        title="{{ f.message }}">{{ f.code }}</span>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="flex">
+  <!-- PDF preview -->
+  <div class="col">
+    <h2>Document</h2>
+    <embed src="{{ url_for('pdf', doc_id=d.id) }}" type="application/pdf"
+           style="width:100%;height:640px;border:1px solid var(--line);border-radius:10px;background:#fff">
+  </div>
+
+  <!-- editable fields + trace -->
+  <div class="col">
+    <h2>Fields <span class="muted">(edit &amp; confirm)</span></h2>
+    <form method="post" action="{{ url_for('confirm', doc_id=d.id) }}">
+      <div class="grid" style="grid-template-columns:1fr 1fr;gap:10px">
+        <div><label>invoice_id (filename)</label>
+          <input name="invoice_id" value="{{ d.fields.invoice_id or '' }}"></div>
+        <div><label>company (folder)</label>
+          <input name="company" value="{{ d.path_info.company or '' }}"></div>
+        <div><label>vendor name (PDF)</label>
+          <input name="vendor_name_pdf" value="{{ d.fields.vendor_name_pdf or '' }}"></div>
+        <div><label>vendor GSTIN</label>
+          <input name="vendor_gstin" value="{{ d.fields.vendor_gstin or '' }}"></div>
+        <div><label>invoice date</label>
+          <input name="invoice_date" value="{{ d.fields.invoice_date or d.fields.invoice_date_raw or '' }}"></div>
+        <div><label>taxable value</label>
+          <input name="taxable_value" value="{{ d.fields.taxable_value if d.fields.taxable_value is not none else '' }}"></div>
+        <div><label>total value</label>
+          <input name="total_value" value="{{ d.fields.total_value if d.fields.total_value is not none else '' }}"></div>
+        <div><label>bill-to name</label>
+          <input name="bill_to_name" value="{{ d.fields.bill_to_name or '' }}"></div>
+        <div><label>bill-to GSTIN</label>
+          <input name="bill_to_gstin" value="{{ d.fields.bill_to_gstin or '' }}"></div>
+      </div>
+      <div style="margin-top:12px"><button class="btn" type="submit">✓ Confirm &amp; save</button></div>
+    </form>
+
+    <h2>Pipeline trace <span class="muted">(why this result)</span></h2>
+    <table>
+      <tr><th style="width:56px">t+s</th><th>stage</th><th>action</th><th>detail</th></tr>
+      {% for e in d.events %}
+      <tr>
+        <td class="mono muted">{{ '%.3f'|format(e.t) }}</td>
+        <td class="mono">{{ e.stage }}</td>
+        <td><span class="pill {{ 'bad' if e.severity.value=='error' else 'warn' if e.severity.value=='warn' else 'info' }}">{{ e.action }}</span></td>
+        <td class="muted">{{ e.detail }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+</div>
+{% endblock %}

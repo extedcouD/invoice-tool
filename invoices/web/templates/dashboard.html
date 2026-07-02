@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — invoices{% endblock %}
+{% block body %}
+<h1>Run <span class="mono">{{ r.run_id }}</span></h1>
+<div class="muted" style="margin-bottom:16px">
+  root <span class="mono">{{ r.root }}</span> · scanned {{ r.started_at }} · finished {{ r.finished_at }}
+</div>
+
+<div id="live" class="card" style="margin-bottom:16px;display:none">
+  <div class="k">pipeline status</div>
+  <div class="v" id="live-stage" style="font-size:18px">—</div>
+  <div class="bar" style="margin-top:8px"><span id="live-bar" style="width:0%"></span></div>
+  <div class="muted mono" id="live-counts" style="margin-top:6px"></div>
+</div>
+
+<div class="grid cards">
+  <div class="card"><div class="k">PDFs</div><div class="v">{{ summary.total_pdfs }}</div></div>
+  <div class="card"><div class="k">Invoices</div><div class="v">{{ summary.invoices }}</div></div>
+  <div class="card"><div class="k">Flagged</div><div class="v" style="color:var(--warn)">{{ summary.flagged }}</div></div>
+  <div class="card"><div class="k">Reviewed</div><div class="v" style="color:var(--ok)">{{ summary.reviewed }}</div></div>
+  <div class="card"><div class="k">Via OCR</div><div class="v">{{ summary.ocr_docs }}</div>
+    <div class="muted">{{ (summary.ocr_ratio*100)|round(0) }}% of PDFs</div></div>
+  <div class="card"><div class="k">Avg confidence</div><div class="v">{{ summary.avg_invoice_confidence }}</div></div>
+</div>
+
+<h2>Detected document types</h2>
+<div class="grid cards">
+  {% for k,v in summary.by_type.items() %}
+  <div class="card"><div class="k">{{ k }}</div><div class="v">{{ v }}</div></div>
+  {% endfor %}
+</div>
+
+<h2>Pipeline stages (timing &amp; throughput)</h2>
+<table>
+  <tr><th>stage</th><th class="right">docs</th><th class="right">errors</th>
+      <th class="right">seconds</th><th class="right">ms/doc</th></tr>
+  {% for m in metrics %}
+  <tr>
+    <td class="mono">{{ m.stage }}</td>
+    <td class="right">{{ m.docs_in }}</td>
+    <td class="right">{% if m.errors %}<span class="pill bad">{{ m.errors }}</span>{% else %}0{% endif %}</td>
+    <td class="right">{{ m.seconds }}</td>
+    <td class="right muted">{{ ((m.seconds/m.docs_in*1000) if m.docs_in else 0)|round(1) }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Review queue</h2>
+<p>{{ summary.flagged }} document(s) need a human look.
+   <a class="btn ghost" href="{{ url_for('review') }}">Open review queue →</a></p>
+
+<script>
+async function poll(){
+  try{
+    const r = await fetch("{{ url_for('status') }}"); const s = await r.json();
+    if(s.state === "running"){
+      document.getElementById("live").style.display = "block";
+      document.getElementById("live-stage").textContent = "stage: " + (s.stage||"—");
+      document.getElementById("live-bar").style.width = (s.pct||0) + "%";
+      document.getElementById("live-counts").textContent =
+        Object.entries(s.counts||{}).map(([k,v])=>k+"="+v).join("  ");
+      setTimeout(poll, 700);
+    }
+  }catch(e){}
+}
+poll();
+</script>
+{% endblock %}

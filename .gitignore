@@ -1,0 +1,13 @@
+# run outputs (regenerated per scan)
+out/
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# os
+.DS_Store
+dummy/

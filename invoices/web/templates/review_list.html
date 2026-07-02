@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Review queue — invoices{% endblock %}
+{% block body %}
+<h1>Review queue <span class="muted">({{ docs|length }} of {{ total }} PDFs)</span></h1>
+<p class="muted">Sorted worst-first. Click a row to preview the PDF and confirm/correct.</p>
+
+{% if not docs %}
+  <div class="card"><span class="pill ok">all clear</span> nothing needs review.</div>
+{% else %}
+<table>
+  <tr><th>id</th><th>company (folder)</th><th>vendor (PDF)</th><th>conf</th>
+      <th>src</th><th>flags</th></tr>
+  {% for d in docs %}
+  <tr onclick="location.href='{{ url_for('doc_detail', doc_id=d.id) }}'" style="cursor:pointer">
+    <td class="mono">{{ d.fields.invoice_id or '—' }}</td>
+    <td>{{ d.path_info.company or '—' }}</td>
+    <td class="muted">{{ d.fields.vendor_name_pdf or '—' }}</td>
+    <td>
+      {% set c = d.confidence %}
+      <span class="pill {{ 'bad' if c<0.6 else 'warn' if c<0.8 else 'ok' }}">{{ '%.2f'|format(c) }}</span>
+    </td>
+    <td><span class="pill {{ 'warn' if d.source.value=='ocr' else 'info' }}">{{ d.source.value }}</span></td>
+    <td>
+      {% for f in d.flags %}
+        <span class="pill {{ 'bad' if f.severity.value=='error' else 'warn' if f.severity.value=='warn' else 'info' }}"
+              title="{{ f.message }}">{{ f.code }}</span>
+      {% endfor %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}
