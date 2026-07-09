@@ -130,6 +130,44 @@ def create_app(controller: RunController) -> Flask:
             write_master(result(), controller.store.master_path())
         return redirect(url_for("review"))
 
+    @app.route("/approve_all", methods=["POST"])
+    def approve_all():
+        with lock:
+            from ..observability.events import record
+            docs = result().flagged()  # snapshot before we mutate `reviewed`
+            for d in docs:
+                d.reviewed = True
+                record(d, "review", "confirmed", "bulk-approved via web UI")
+            if docs:
+                controller.store.save(result())
+                write_master(result(), controller.store.master_path())
+        return redirect(url_for("review"))
+
+    @app.route("/finish", methods=["POST"])
+    def finish():
+        """Finalize review: write the master, then (deferred) link to GSTR-2A.
+
+        Runs *after* review so corrections reach the linked workbook + flat
+        invoice folder, and renders a page naming every file it wrote.
+        """
+        r = result()
+        if r is None or controller.store is None:
+            return redirect(url_for("home"))
+        report, error = None, None
+        with lock:
+            master = write_master(r, controller.store.master_path())
+            if controller.gstr_path:
+                try:
+                    report = controller.link_now()
+                except Exception as exc:  # surface on-page, don't 500
+                    error = f"Linking failed: {exc}"
+            else:
+                error = ("No GSTR-2A workbook was chosen for this run, so there is "
+                         "nothing to link — only the master workbook was written.")
+        return render_template("finish.html", report=report, error=error,
+                               master_path=str(master), store=controller.store,
+                               remaining=len(r.flagged()))
+
     @app.route("/export", methods=["POST"])
     def export():
         with lock:

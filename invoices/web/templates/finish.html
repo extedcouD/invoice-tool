@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Export complete — invoices{% endblock %}
+{% block body %}
+<h1>✓ Review finished &amp; exported</h1>
+
+{% if remaining %}
+<div class="banner" style="background:rgba(232,161,60,.12);color:var(--warn);border:1px solid rgba(232,161,60,.4)">
+  Heads up — {{ remaining }} document(s) were still unreviewed and were exported as-is.
+  <a href="{{ url_for('review') }}">Back to review</a>
+</div>
+{% endif %}
+{% if error %}
+<div class="banner bad">{{ error }}</div>
+{% endif %}
+
+<h2>Saved files <span class="muted">(all inside the run folder)</span></h2>
+<table>
+  <tr><th>what</th><th>path</th></tr>
+  {% if report %}
+  <tr><td>GSTR-2A linked workbook</td><td class="mono">{{ report.out_path }}</td></tr>
+  <tr><td>Matched invoice PDFs (flat folder)</td><td class="mono">{{ report.flat_dir }}</td></tr>
+  {% endif %}
+  <tr><td>Master workbook</td><td class="mono">{{ master_path }}</td></tr>
+  <tr><td>Run folder</td><td class="mono">{{ store.dir }}</td></tr>
+</table>
+
+{% if report %}
+<h2>Link result</h2>
+<div class="grid cards" style="margin-bottom:14px">
+  <div class="card"><div class="k">Matched</div><div class="v">{{ report.matched }}</div></div>
+  <div class="card"><div class="k">B2B rows</div><div class="v">{{ report.total }}</div></div>
+  <div class="card"><div class="k">Not found</div><div class="v">{{ report.not_found }}</div></div>
+  <div class="card"><div class="k">Ambiguous</div><div class="v">{{ report.ambiguous }}</div></div>
+</div>
+{% endif %}
+
+<div class="flex" style="gap:12px;flex-wrap:wrap;margin-top:6px">
+  <button class="btn big" id="open-out" type="button" style="display:none">Open output folder</button>
+  <a class="btn big ghost" href="{{ url_for('review') }}">← Back to review</a>
+  <a class="btn big ghost" href="{{ url_for('home') }}">Home</a>
+</div>
+
+<script>
+  // In the native desktop app, offer a one-click "open folder"; browsers get the
+  // copyable paths above.
+  if(window.pywebview && window.pywebview.api){
+    const b = document.getElementById("open-out");
+    b.style.display = "inline-block";
+    b.onclick = () => window.pywebview.api.open_output();
+  }
+</script>
+{% endblock %}

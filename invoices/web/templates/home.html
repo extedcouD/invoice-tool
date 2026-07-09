@@ -146,6 +146,9 @@ function finishDone(rs){
     $("link-line").textContent = `GSTR-2A: linked ${l.matched}/${l.total} rows`
       + (l.not_found ? `, ${l.not_found} not found` : "")
       + (l.ambiguous ? `, ${l.ambiguous} ambiguous` : "") + ".";
+  } else if(rs.has_gstr){
+    $("link-line").textContent = "GSTR-2A linking runs after review — open the "
+      + "review queue and click “Finish & export” to write the linked workbook + invoice folder.";
   }
   if(hasNative()){
     $("open-out").style.display = "inline-block";

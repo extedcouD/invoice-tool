@@ -1,4 +1,4 @@
-``
+`pyinstaller packaging/InvoiceGSTRLinker.spec --noconfirm```
 
 # invoices-tool — invoice detection & linking (Phase 1)
 
@@ -49,6 +49,28 @@ Output per run lands in `out/run_<timestamp>/`:
 - **Dashboard** (`/`) — counts, doc-type mix, per-stage timing/throughput, live progress bar while a scan runs.
 - **Review queue** (`/review`) — flagged docs, worst-first. Only low-confidence rows land here.
 - **Doc view** (`/doc/<id>`) — PDF preview beside editable fields; **Confirm & save** writes the correction back and re-exports the workbook. Below it, the **pipeline trace**: every decision the pipeline made about this PDF and why.
+
+---
+
+## Build the desktop app (macOS Apple Silicon)
+
+Bundles Python, all deps, and the Tesseract OCR engine into a double-click
+`.app` — the end user installs nothing. Run this **natively on an Apple Silicon
+(arm64) Mac** and the resulting bundle is Apple Silicon:
+
+```bash
+brew install tesseract                        # must be on PATH at build time
+pip install -r requirements.txt pyinstaller
+pyinstaller packaging/InvoiceGSTRLinker.spec --noconfirm
+# -> dist/InvoiceGSTRLinker.app
+
+# zip it for distribution (same layout the CI publishes)
+cd dist && zip -r ../InvoiceGSTRLinker-macOS-AppleSilicon.zip InvoiceGSTRLinker.app
+```
+
+Prefer not to build locally? Push a `v*` tag or run the **build-desktop-apps**
+GitHub Action (`.github/workflows/build-desktop-apps.yml`) — its `macos-14`
+runner builds the Apple Silicon app (and a Windows `.exe`) in the cloud.
 
 ---
 

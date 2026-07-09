@@ -1,7 +1,21 @@
 {% extends "base.html" %}
 {% block title %}Review queue — invoices{% endblock %}
 {% block body %}
-<h1>Review queue <span class="muted">({{ docs|length }} of {{ total }} PDFs)</span></h1>
+<div style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap">
+  <h1 style="margin:0">Review queue <span class="muted">({{ docs|length }} of {{ total }} PDFs)</span></h1>
+  <div style="display:flex;gap:10px;flex-wrap:wrap">
+    {% if docs %}
+    <form method="post" action="{{ url_for('approve_all') }}"
+          onsubmit="return confirm('Approve all {{ docs|length }} flagged document(s) as-is? This marks them reviewed without edits.')">
+      <button class="btn" type="submit">✓ Approve all ({{ docs|length }})</button>
+    </form>
+    {% endif %}
+    <form method="post" action="{{ url_for('finish') }}"
+          onsubmit="return confirm({% if docs %}'Export now? {{ docs|length }} document(s) are still unreviewed and will be exported as-is.'{% else %}'Export the final GSTR-linked workbook and matched-invoice folder now?'{% endif %})">
+      <button class="btn ghost" type="submit">Finish &amp; export →</button>
+    </form>
+  </div>
+</div>
 <p class="muted">Sorted worst-first. Click a row to preview the PDF and confirm/correct.</p>
 
 {% if not docs %}

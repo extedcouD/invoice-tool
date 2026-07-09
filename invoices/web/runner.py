@@ -5,7 +5,11 @@ UI can poll live progress while it happens. One source of truth shared by both
 the Flask views (which *render* what's happening) and the pywebview bridge
 (which *starts* the job and provides native file dialogs).
 
-Phases:  idle → scanning → [linking] → done   (or → error at any point)
+Phases:  idle → scanning → done   (or → error at any point)
+
+GSTR-2A linking is no longer part of the scan; it is deferred and triggered
+on demand via :meth:`link_now` from the review UI's "Finish & export" action,
+so the linked workbook + flat invoice folder reflect human review corrections.
 
 The scan itself streams fine-grained progress into ``status.json`` via
 ``StatusWriter``; this controller layers the coarse phase on top and exposes it
@@ -38,6 +42,7 @@ class RunController:
         self.phase: str = "idle"          # idle|scanning|linking|done|error
         self.error: Optional[str] = None
         self.link_report = None
+        self.gstr_path: Optional[Path] = None   # remembered for post-review linking
         self._thread: Optional[threading.Thread] = None
 
     # ---- lifecycle ---------------------------------------------------------
@@ -64,27 +69,24 @@ class RunController:
             self.store = RunStore.new(self.output_root)
             self.result = None
             self.link_report = None
+            self.gstr_path = gstr           # linked later, after review (see link_now)
             self.error = None
             self.phase = "scanning"
             self._thread = threading.Thread(
-                target=self._run, args=(inv, gstr), daemon=True)
+                target=self._run, args=(inv,), daemon=True)
             self._thread.start()
             return {"ok": True, "run_id": self.store.run_id}
 
-    def _run(self, invoice_root: Path, gstr_path: Optional[Path]) -> None:
+    def _run(self, invoice_root: Path) -> None:
         try:
             store, result = run_scan(invoice_root, self.output_root,
                                      self.settings, quiet=True, store=self.store)
             with self._lock:
                 self.store, self.result = store, result
-            if gstr_path is not None:
-                with self._lock:
-                    self.phase = "linking"
-                report = link_gstr(result, gstr_path, store)
-                with self._lock:
-                    self.link_report = report
-            with self._lock:
                 self.phase = "done"
+            # GSTR linking is deliberately deferred: it now runs from the review
+            # UI's "Finish & export" action (web/app.py::finish -> link_now) so the
+            # linked workbook + flat invoice folder reflect human corrections.
         except Exception as exc:  # never let the worker thread die silently
             with self._lock:
                 self.error = str(exc)
@@ -94,6 +96,21 @@ class RunController:
                 (self.output_root / "last_error.txt").write_text(traceback.format_exc())
             except OSError:
                 pass
+
+    def link_now(self) -> Optional[Any]:
+        """Run GSTR-2A linking for the (possibly reviewed) result, on demand.
+
+        Deferred from the scan so the linked workbook + flat invoice folder
+        reflect corrections made in review. Returns the ``LinkReport``, or None
+        if this run had no GSTR-2A workbook. Callers hold the app write-lock so
+        no review edit mutates ``result`` mid-link.
+        """
+        if self.gstr_path is None or self.result is None or self.store is None:
+            return None
+        report = link_gstr(self.result, self.gstr_path, self.store)
+        with self._lock:
+            self.link_report = report
+        return report
 
     # ---- views -------------------------------------------------------------
     def status(self) -> dict:
@@ -116,6 +133,7 @@ class RunController:
                 "has_result": self.result is not None,
                 "run_id": self.store.run_id if self.store else None,
                 "output_dir": str(self.store.dir) if self.store else None,
+                "has_gstr": self.gstr_path is not None,
             }
             if self.result is not None:
                 st["summary"] = self.result.summary()
