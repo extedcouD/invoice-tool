@@ -11,7 +11,8 @@ from invoices.stages.parse import _id_from_filename
 from invoices.stages.classify import ClassifyStage
 from invoices.stages.parse import ParseStage
 from invoices.stages.walk import _parse_path
-from invoices.core.models import Document, DocType
+from invoices.io.gstr import _build_index, _resolve, _flat_name
+from invoices.core.models import Document, DocType, Fields
 
 
 # --------------------------------------------------------------------------- #
@@ -29,6 +30,46 @@ def test_vendor_score_high_for_suffix_variants():
 
 def test_vendor_score_low_for_different_companies():
     assert vendor.score("Apex Business Consultants", "Urban Tiffin Foods") < 70
+
+
+def test_norm_id_bridges_slash_and_dash():
+    # GSTR "Invoice Number" uses slashes; our detected ids use dashes.
+    assert vendor.norm_id("APEX/22-23/003") == vendor.norm_id("APEX-22-23-003") == "apex2223003"
+    assert vendor.norm_id(None) == ""
+
+
+def test_norm_gstin_uppercases_and_strips():
+    assert vendor.norm_gstin(" 36aaeca4456f1z1 ") == "36AAECA4456F1Z1"
+    assert vendor.norm_gstin(None) == ""
+
+
+# --------------------------------------------------------------------------- #
+# GSTR linking: match index + flat naming
+# --------------------------------------------------------------------------- #
+def _inv(doc_id, invoice_id=None, content_no=None, gstin=None):
+    d = Document(id=doc_id, path=f"/{doc_id}.pdf", filename=f"{doc_id}.pdf",
+                 doc_type=DocType.INVOICE)
+    d.fields = Fields(invoice_id=invoice_id, invoice_no_content=content_no, vendor_gstin=gstin)
+    return d
+
+
+def test_gstr_index_matches_junk_filename_by_content_number():
+    # A junk-named invoice still links via the number printed inside the PDF.
+    junk = _inv("d0", invoice_id="536evcjkfvort845",
+                content_no="APEX/22-23/003", gstin="36AAECA4456F1Z1")
+    by_key, by_invno = _build_index([junk])
+    g, n = vendor.norm_gstin("36AAECA4456F1Z1"), vendor.norm_id("APEX-22-23-003")
+    assert _resolve(by_key, by_invno, g, n) == [junk]
+
+
+def test_gstr_index_no_match_returns_empty():
+    d = _inv("d0", invoice_id="APEX-22-23-003", gstin="36AAECA4456F1Z1")
+    by_key, by_invno = _build_index([d])
+    assert _resolve(by_key, by_invno, vendor.norm_gstin("07XXX"), vendor.norm_id("NOPE/1")) == []
+
+
+def test_gstr_flat_name_from_row_identity():
+    assert _flat_name("36AAECA4456F1Z1", "APEX/22-23/003") == "36AAECA4456F1Z1__APEX-22-23-003.pdf"
 
 
 # --------------------------------------------------------------------------- #

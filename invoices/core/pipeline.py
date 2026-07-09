@@ -4,7 +4,8 @@ Design goals:
   - Deterministic order, explainable per-doc (events), measurable (metrics).
   - Fault-isolated: one bad PDF flags itself and the run continues.
   - Observable: emits live progress after each document.
-  - Scalable: `workers > 1` maps documents across a process pool.
+  - Scalable: `workers > 1` maps documents across a thread pool (OCR shells out
+    to the tesseract binary, so threads give real parallelism).
 """
 from __future__ import annotations
 
