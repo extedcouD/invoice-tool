@@ -97,9 +97,11 @@ def _copy_flagged(result: RunResult, store: RunStore) -> None:
 
 
 def run_scan(root: Path, out_root: Path, settings: Settings = DEFAULTS,
-             quiet: bool = False) -> tuple[RunStore, RunResult]:
+             quiet: bool = False, store: RunStore | None = None) -> tuple[RunStore, RunResult]:
     root = Path(root)
-    store = RunStore.new(out_root)
+    # A caller (e.g. the desktop RunController) may pre-create the run dir so it
+    # can poll status.json from t=0; otherwise mint a fresh one here.
+    store = store or RunStore.new(out_root)
 
     reporter = MultiReporter(
         StatusWriter(store.status_path),

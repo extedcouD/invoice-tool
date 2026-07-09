@@ -1,18 +1,23 @@
-"""Minimal desktop GUI: pick an invoice folder + a GSTR-2A file, click Run.
+"""Desktop app: one native window that scans a folder of invoices, shows exactly
+what the pipeline is doing *live*, and lets you review flagged documents — all
+in the same place.
 
-Wraps the same scan -> link pipeline the CLI uses, so a non-technical user never
-touches a command line. Packaged into a double-click app with PyInstaller
-(packaging/InvoiceGSTRLinker.spec); when frozen it uses a bundled tesseract so the
-user installs nothing.
+Under the hood it hosts the Flask app (`invoices/web`) inside a pywebview window:
+Flask serves the UI + live progress + review queue; a tiny JS-API bridge gives
+the page native "Choose folder / file" dialogs. If a webview runtime isn't
+available (or you pass `--web`), it falls back to opening the UI in your browser.
+
+Packaged into a double-click app with PyInstaller (packaging/InvoiceGSTRLinker.spec);
+when frozen it uses a bundled tesseract so the user installs nothing.
 """
 from __future__ import annotations
 
 import os
-import queue
 import subprocess
 import sys
 import threading
-import traceback
+import time
+import urllib.request
 from pathlib import Path
 
 OUTPUT_ROOT = Path.home() / "InvoiceLinker_output"
@@ -44,8 +49,71 @@ def _open_folder(path: Path) -> None:
         pass
 
 
+# --------------------------------------------------------------------------- #
+# Web host
+# --------------------------------------------------------------------------- #
+def _serve_flask(app) -> str:
+    """Start the Flask app on a free loopback port in a daemon thread.
+
+    Uses `make_server` (rather than `app.run` + a pre-picked port) so we read
+    back the *actual* bound port and avoid a bind/rebind race. Returns the URL.
+    """
+    import logging
+
+    from werkzeug.serving import make_server
+
+    # this is a local single-user UI server; don't spew a request log line per poll
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+    server = make_server("127.0.0.1", 0, app, threaded=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{server.server_port}/"
+
+
+def _wait_until_up(url: str, timeout: float = 8.0) -> bool:
+    """Poll the local server until it answers, so the window doesn't flash an
+    'unable to connect' page before Flask has bound its socket."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            urllib.request.urlopen(url, timeout=0.5)
+            return True
+        except Exception:
+            time.sleep(0.1)
+    return False
+
+
+class WebviewApi:
+    """JS bridge exposed to the page as `window.pywebview.api` — native dialogs
+    and 'open output folder'. The heavy lifting (start/poll) goes through Flask."""
+
+    def __init__(self, controller) -> None:
+        self.controller = controller
+        self.window = None
+
+    def pick_folder(self):
+        import webview
+        res = self.window.create_file_dialog(webview.FOLDER_DIALOG)
+        return res[0] if res else None
+
+    def pick_gstr(self):
+        import webview
+        res = self.window.create_file_dialog(
+            webview.OPEN_DIALOG,
+            file_types=("Excel workbook (*.xlsx;*.xls)", "All files (*.*)"),
+        )
+        return res[0] if res else None
+
+    def open_output(self):
+        d = self.controller.store.dir if self.controller.store else OUTPUT_ROOT
+        _open_folder(Path(d))
+        return str(d)
+
+
+# --------------------------------------------------------------------------- #
+# Headless CLI (frozen-bundle smoke test / automation)
+# --------------------------------------------------------------------------- #
 def _run_pipeline(invoice_root: Path, gstr_path: Path):
-    """Blocking scan + link (runs in a worker thread). Returns (store, report)."""
+    """Blocking scan + link. Returns (store, report)."""
     from dataclasses import replace
 
     from .config import DEFAULTS
@@ -73,110 +141,47 @@ def _run_cli(argv: list[str]) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
 def main() -> None:
     configure_bundled_tesseract()
-    if sys.argv[1:2] == ["--cli"]:
-        raise SystemExit(_run_cli(sys.argv[2:]))
-    import tkinter as tk
-    from tkinter import filedialog, ttk
+    argv = sys.argv[1:]
+    if argv[:1] == ["--cli"]:
+        raise SystemExit(_run_cli(argv[1:]))
 
-    root = tk.Tk()
-    root.title("Invoice → GSTR Linker")
-    root.geometry("580x340")
-    root.resizable(False, False)
+    from .web.app import create_app
+    from .web.runner import RunController
 
-    state: dict = {"invoice": None, "gstr": None}
-    q: "queue.Queue" = queue.Queue()
+    controller = RunController(OUTPUT_ROOT)
+    app = create_app(controller)
+    url = _serve_flask(app)
+    _wait_until_up(url)
 
-    frm = ttk.Frame(root, padding=18)
-    frm.pack(fill="both", expand=True)
-    frm.columnconfigure(1, weight=1)
-
-    inv_var = tk.StringVar(value="(none chosen)")
-    gstr_var = tk.StringVar(value="(none chosen)")
-    status_var = tk.StringVar(value="Choose the invoice folder and the GSTR-2A file, then Run.")
-
-    def choose_invoice():
-        d = filedialog.askdirectory(title="Choose the invoice folder (the FY.. tree)")
-        if d:
-            state["invoice"] = Path(d)
-            inv_var.set(d)
-
-    def choose_gstr():
-        f = filedialog.askopenfilename(title="Choose the GSTR-2A .xlsx file",
-                                       filetypes=[("Excel workbook", "*.xlsx"), ("All files", "*.*")])
-        if f:
-            state["gstr"] = Path(f)
-            gstr_var.set(f)
-
-    ttk.Label(frm, text="1.  Invoice folder").grid(row=0, column=0, sticky="w", pady=6)
-    ttk.Label(frm, textvariable=inv_var, foreground="#666").grid(row=0, column=1, sticky="w", padx=8)
-    ttk.Button(frm, text="Choose…", command=choose_invoice).grid(row=0, column=2)
-
-    ttk.Label(frm, text="2.  GSTR-2A file").grid(row=1, column=0, sticky="w", pady=6)
-    ttk.Label(frm, textvariable=gstr_var, foreground="#666").grid(row=1, column=1, sticky="w", padx=8)
-    ttk.Button(frm, text="Choose…", command=choose_gstr).grid(row=1, column=2)
-
-    run_btn = ttk.Button(frm, text="Run")
-    run_btn.grid(row=2, column=0, columnspan=3, pady=14, ipadx=20, ipady=4)
-
-    bar = ttk.Progressbar(frm, mode="indeterminate", length=520)
-    status = ttk.Label(frm, textvariable=status_var, wraplength=520, justify="left")
-    status.grid(row=4, column=0, columnspan=3, sticky="w", pady=6)
-    open_btn = ttk.Button(frm, text="Open output folder")
-
-    def poll():
+    # Prefer a native window; fall back to the browser if no webview runtime.
+    if "--web" not in argv:
         try:
-            kind, *rest = q.get_nowait()
-        except queue.Empty:
-            root.after(150, poll)
+            import webview
+        except Exception:
+            webview = None
+        if webview is not None:
+            api = WebviewApi(controller)
+            window = webview.create_window(
+                "Invoice → GSTR Linker", url, js_api=api,
+                width=1180, height=820, min_size=(920, 660),
+            )
+            api.window = window
+            webview.start()
             return
-        bar.stop()
-        bar.grid_forget()
-        run_btn.configure(state="normal")
-        if kind == "ok":
-            store, report = rest
-            msg = f"✓ Linked {report.matched}/{report.total} invoices."
-            if report.not_found:
-                msg += (f"  {report.not_found} could not be matched "
-                        f"(listed on the 'Link Report' sheet).")
-            msg += f"\n\nOutput saved to:\n{store.dir}"
-            status_var.set(msg)
-            open_btn.configure(command=lambda: _open_folder(store.dir))
-            open_btn.grid(row=5, column=0, columnspan=3, pady=8)
-        else:
-            exc, tb = rest
-            status_var.set(f"Something went wrong:\n{exc}\n\n"
-                           "Check that the folder and GSTR-2A file are correct and try again.")
-            try:
-                OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-                (OUTPUT_ROOT / "last_error.txt").write_text(tb)
-            except Exception:
-                pass
 
-    def worker(invoice_root: Path, gstr_path: Path):
-        try:
-            store, report = _run_pipeline(invoice_root, gstr_path)
-            q.put(("ok", store, report))
-        except Exception as exc:  # surface a friendly message, keep full trace in a log
-            q.put(("err", exc, traceback.format_exc()))
-
-    def on_run():
-        if not state["invoice"] or not state["gstr"]:
-            status_var.set("Please choose BOTH the invoice folder and the GSTR-2A file first.")
-            return
-        open_btn.grid_forget()
-        run_btn.configure(state="disabled")
-        status_var.set("Working… scanning invoices and linking. This can take a minute "
-                       "(scanned/photo invoices take longer).")
-        bar.grid(row=3, column=0, columnspan=3, pady=4)
-        bar.start(12)
-        threading.Thread(target=worker, args=(state["invoice"], state["gstr"]),
-                         daemon=True).start()
-        root.after(150, poll)
-
-    run_btn.configure(command=on_run)
-    root.mainloop()
+    # Browser fallback — keep the process (and Flask thread) alive.
+    import webbrowser
+    webbrowser.open(url)
+    print(f"Invoice → GSTR Linker running at {url}  (Ctrl-C to quit)")
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

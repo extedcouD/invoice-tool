@@ -70,12 +70,23 @@ for f in tessdata.rglob("*"):
         dest = "tesseract/tessdata" if str(rel) == "." else os.path.join("tesseract", "tessdata", str(rel))
         datas.append((str(f), dest))
 
+# The desktop app hosts the Flask UI, so its Jinja templates must ride along in
+# the bundle (Flask loads them from invoices/web/templates at runtime).
+for f in (ROOT / "invoices" / "web" / "templates").glob("*.html"):
+    datas.append((str(f), os.path.join("invoices", "web", "templates")))
+
+# pywebview: bundle its platform backends (cocoa / edgechromium / gtk / …) and
+# any data files. collect_submodules picks up the backend that's imported lazily.
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+datas += collect_data_files("webview")
+hiddenimports = ["pytesseract"] + collect_submodules("webview")
+
 a = Analysis(
     [str(ROOT / "run_gui.py")],
     pathex=[str(ROOT)],
     binaries=binaries,
     datas=datas,
-    hiddenimports=["pytesseract"],
+    hiddenimports=hiddenimports,
     excludes=["pandas", "matplotlib", "PyQt5", "PyQt6", "PySide2", "PySide6",
               "IPython", "notebook", "pytest"],
     noarchive=False,

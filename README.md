@@ -1,3 +1,5 @@
+``
+
 # invoices-tool — invoice detection & linking (Phase 1)
 
 Scrapes a human-maintained folder tree, detects which PDFs are **invoices**
@@ -62,17 +64,17 @@ walk ─▶ Document(s) ─▶ [ extract ─▶ classify ─▶ parse ─▶ rec
                                                            cross-check   + flags
 ```
 
-| layer         | dir                  | responsibility                                                   |
-| ------------- | -------------------- | ---------------------------------------------------------------- |
-| domain        | `core/models.py`     | `Document`, `Fields`, `Event`, `Flag`, `RunResult` (pydantic)    |
+| layer         | dir                  | responsibility                                                                              |
+| ------------- | -------------------- | ------------------------------------------------------------------------------------------- |
+| domain        | `core/models.py`     | `Document`, `Fields`, `Event`, `Flag`, `RunResult` (pydantic)                               |
 | engine        | `core/pipeline.py`   | runs stages, times them, isolates faults, maps documents across a thread pool (`--workers`) |
-| contracts     | `core/interfaces.py` | `Stage`, `TextSource` ABCs                                       |
-| extractors    | `extractors.py`      | default baseline + pluggable**per-vendor** field extractors      |
-| stages        | `stages/`            | walk · extract · classify · parse · reconcile · validate         |
-| io            | `io/`                | `pdf.py` (PyMuPDF + Tesseract) · `runstore.py` · `excel.py`      |
-| matching      | `matching/vendor.py` | normalize + rapidfuzz + GSTIN canonicalization                   |
-| observability | `observability/`     | events · progress reporters (rich + status.json)                 |
-| web           | `web/`               | Flask review app + dashboard + trace viewer                      |
+| contracts     | `core/interfaces.py` | `Stage`, `TextSource` ABCs                                                                  |
+| extractors    | `extractors.py`      | default baseline + pluggable**per-vendor** field extractors                                 |
+| stages        | `stages/`            | walk · extract · classify · parse · reconcile · validate                                    |
+| io            | `io/`                | `pdf.py` (PyMuPDF + Tesseract) · `runstore.py` · `excel.py`                                 |
+| matching      | `matching/vendor.py` | normalize + rapidfuzz + GSTIN canonicalization                                              |
+| observability | `observability/`     | events · progress reporters (rich + status.json)                                            |
+| web           | `web/`               | Flask review app + dashboard + trace viewer                                                 |
 
 **Patterns:** pipeline (stages), strategy (text vs OCR behind `TextSource`),
 registry (field extractors), DI (stages receive deps), config-driven (all

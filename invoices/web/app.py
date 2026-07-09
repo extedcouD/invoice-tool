@@ -1,9 +1,11 @@
-"""Flask app: review queue + live dashboard + per-document trace viewer.
+"""Flask app: setup + live progress + review queue + per-document trace viewer.
 
-One app instance is bound to one run (a RunStore). It reads detections.json
-into memory, serves the review workflow, and writes corrections back (then
-re-exports the workbook). The dashboard polls status.json so it also reflects a
-scan that is still in progress.
+The app is a *view* over a :class:`RunController` (`web/runner.py`), which owns
+the state of the current scan(+link) job. It can be served before any run
+exists — the home page lets you choose the invoice folder + GSTR file, kicks off
+the job, streams live progress, and then hands you straight into the integrated
+review queue. `review`/`export` write corrections back and re-export the
+workbook. Nothing here re-scans; it renders whatever the controller holds.
 """
 from __future__ import annotations
 
@@ -12,34 +14,43 @@ import threading
 import webbrowser
 from pathlib import Path
 
-from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, url_for
+from flask import (Flask, abort, jsonify, redirect, render_template, request,
+                   send_file, url_for)
 
-from ..core.models import RunResult
 from ..io.excel import write_master
 from ..io.runstore import RunStore
+from .runner import RunController
 
 
-def create_app(store: RunStore) -> Flask:
+def create_app(controller: RunController) -> Flask:
     app = Flask(__name__)
-    state: dict[str, RunResult] = {"result": store.load()}
     lock = threading.Lock()
 
-    def result() -> RunResult:
-        return state["result"]
+    def result():
+        return controller.result
 
     def doc_by_id(doc_id: str):
-        return next((d for d in result().documents if d.id == doc_id), None)
+        r = result()
+        return next((d for d in r.documents if d.id == doc_id), None) if r else None
 
     # ---- pages -----------------------------------------------------------
     @app.route("/")
+    def home():
+        return render_template("home.html", state=controller.run_state())
+
+    @app.route("/dashboard")
     def dashboard():
         r = result()
+        if not r:
+            return redirect(url_for("home"))
         return render_template("dashboard.html", r=r, summary=r.summary(),
-                               metrics=r.stage_metrics, store=store)
+                               metrics=r.stage_metrics, store=controller.store)
 
     @app.route("/review")
     def review():
         r = result()
+        if not r:
+            return redirect(url_for("home"))
         # sort worst-first: hard flags & low confidence at the top
         docs = sorted(r.flagged(), key=lambda d: (d.confidence, -len(d.flags)))
         return render_template("review_list.html", docs=docs, total=len(r.documents))
@@ -54,21 +65,33 @@ def create_app(store: RunStore) -> Flask:
     # ---- data / actions --------------------------------------------------
     @app.route("/status")
     def status():
-        if store.status_path.exists():
-            return jsonify(json.loads(store.status_path.read_text()))
-        return jsonify({"state": "unknown"})
+        return jsonify(controller.status())
+
+    @app.route("/run_state")
+    def run_state():
+        return jsonify(controller.run_state())
+
+    @app.route("/api/start", methods=["POST"])
+    def api_start():
+        data = request.get_json(silent=True) or request.form
+        invoice = (data.get("invoice") or "").strip()
+        gstr = (data.get("gstr") or "").strip() or None
+        if not invoice:
+            return jsonify({"ok": False, "error": "Choose the invoice folder first."}), 400
+        res = controller.start(invoice, gstr)
+        return jsonify(res), (200 if res.get("ok") else 400)
 
     @app.route("/api/docs")
     def api_docs():
-        return jsonify([json.loads(d.model_dump_json()) for d in result().documents])
+        r = result()
+        return jsonify([json.loads(d.model_dump_json()) for d in r.documents] if r else [])
 
     @app.route("/pdf/<doc_id>")
     def pdf(doc_id):
         d = doc_by_id(doc_id)
         if not d:
             abort(404)
-        candidates = [d.review_pdf_path, d.path]
-        for cand in candidates:
+        for cand in (d.review_pdf_path, d.path):
             if not cand:
                 continue
             p = Path(cand)
@@ -103,21 +126,31 @@ def create_app(store: RunStore) -> Flask:
             d.reviewed = True
             from ..observability.events import record
             record(d, "review", "confirmed", "human-confirmed via web UI")
-            store.save(result())
-            write_master(result(), store.master_path())
+            controller.store.save(result())
+            write_master(result(), controller.store.master_path())
         return redirect(url_for("review"))
 
     @app.route("/export", methods=["POST"])
     def export():
         with lock:
-            path = write_master(result(), store.master_path())
+            path = write_master(result(), controller.store.master_path())
         return jsonify({"ok": True, "path": str(path)})
 
     return app
 
 
 def serve(store: RunStore, port: int = 5000, open_browser: bool = True) -> None:
-    app = create_app(store)
+    """CLI entry point: serve a *completed* run (from `scan`/`review`).
+
+    Wraps the finished store in a controller already in the ``done`` phase, so
+    the same app renders the dashboard/review without re-scanning.
+    """
+    controller = RunController(store.dir.parent)
+    controller.store = store
+    controller.result = store.load()
+    controller.phase = "done"
+
+    app = create_app(controller)
     url = f"http://127.0.0.1:{port}/"
     if open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()

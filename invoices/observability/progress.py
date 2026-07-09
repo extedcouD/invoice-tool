@@ -11,6 +11,7 @@ The pipeline only depends on the `Reporter` interface, so adding a new sink
 from __future__ import annotations
 
 import json
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -21,10 +22,16 @@ from rich.table import Table
 
 
 class Reporter:
-    """No-op base; safe to use when no reporting is wanted."""
+    """No-op base; safe to use when no reporting is wanted.
+
+    `note` (optional) describes the document that just finished — file name,
+    detected type, text source, confidence, flag count — so a sink can render a
+    live "what's happening right now" feed, not just a percentage.
+    """
 
     def start(self, total: int) -> None: ...
-    def update(self, done: int, total: int, stage: str, counts: dict) -> None: ...
+    def update(self, done: int, total: int, stage: str, counts: dict,
+               note: Optional[dict] = None) -> None: ...
     def stage_timing(self, timings: dict[str, float]) -> None: ...
     def finish(self, summary: dict) -> None: ...
 
@@ -37,9 +44,10 @@ class MultiReporter(Reporter):
         for r in self._rs:
             r.start(total)
 
-    def update(self, done: int, total: int, stage: str, counts: dict) -> None:
+    def update(self, done: int, total: int, stage: str, counts: dict,
+               note: Optional[dict] = None) -> None:
         for r in self._rs:
-            r.update(done, total, stage, counts)
+            r.update(done, total, stage, counts, note)
 
     def stage_timing(self, timings: dict[str, float]) -> None:
         for r in self._rs:
@@ -57,6 +65,8 @@ class StatusWriter(Reporter):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._total = 0
+        # newest-first tail of finished docs, for the live activity feed
+        self._recent: deque[dict] = deque(maxlen=40)
 
     def _write(self, payload: dict) -> None:
         tmp = self.path.with_suffix(".tmp")
@@ -66,16 +76,23 @@ class StatusWriter(Reporter):
     def start(self, total: int) -> None:
         self._total = total
         self._write({"state": "running", "done": 0, "total": total,
-                     "stage": "starting", "counts": {}})
+                     "stage": "starting", "counts": {}, "pct": 0.0,
+                     "current": None, "recent": []})
 
-    def update(self, done: int, total: int, stage: str, counts: dict) -> None:
+    def update(self, done: int, total: int, stage: str, counts: dict,
+               note: Optional[dict] = None) -> None:
+        if note:
+            self._recent.appendleft(note)
         self._write({"state": "running", "done": done, "total": total,
                      "stage": stage, "counts": counts,
-                     "pct": round(100 * done / total, 1) if total else 0.0})
+                     "pct": round(100 * done / total, 1) if total else 0.0,
+                     "current": (note or {}).get("file"),
+                     "recent": list(self._recent)})
 
     def finish(self, summary: dict) -> None:
         self._write({"state": "done", "done": self._total, "total": self._total,
-                     "stage": "finished", "summary": summary})
+                     "stage": "finished", "summary": summary, "pct": 100.0,
+                     "current": None, "recent": list(self._recent)})
 
 
 class RichReporter(Reporter):
@@ -113,7 +130,8 @@ class RichReporter(Reporter):
         self._live = Live(self._render(), console=self.console, refresh_per_second=8)
         self._live.start()
 
-    def update(self, done: int, total: int, stage: str, counts: dict) -> None:
+    def update(self, done: int, total: int, stage: str, counts: dict,
+               note: Optional[dict] = None) -> None:
         self._stage, self._counts = stage, counts
         if self._progress is not None and self._task is not None:
             self._progress.update(self._task, completed=done, total=total)

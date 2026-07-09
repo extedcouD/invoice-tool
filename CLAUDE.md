@@ -69,6 +69,15 @@ Key structural facts (each requires reading several files to reconstruct):
   `doc_type == INVOICE` — except `parse` always sets `invoice_id` from the filename first.
 - **The run directory is the single source of truth.** `review` and `export` load
   `detections.json` and never re-scan. `RunStore` (`io/runstore.py`) owns the layout.
+- **The desktop app (`gui.py`) hosts the web UI, it is not a separate UI.** It starts
+  the Flask app (`web/app.py`) in a thread and shows it in a native pywebview window
+  (browser fallback via `--web`). A shared `RunController` (`web/runner.py`) owns the
+  live job (phase `idle→scanning→[linking]→done`); the page's `home.html` picks the
+  folder/GSTR via a `WebviewApi` native-dialog bridge, POSTs `/api/start`, then polls
+  `/status` (fine-grained scan progress: `current` file + `recent[]` feed + counts,
+  written by `StatusWriter`) and `/run_state` (coarse phase) to drive one screen:
+  setup → live activity feed → integrated review queue. Don't reintroduce a
+  progress-less spinner — the live feed *is* the observability surface for end users.
 - **Fault isolation.** `Pipeline.run_one` wraps each stage in try/except: a failure flags
   `stage_error` on that one doc and the run continues. Never let a stage crash the whole run.
 - **`workers > 1` uses a `ThreadPoolExecutor`, not processes.** OCR shells out to the

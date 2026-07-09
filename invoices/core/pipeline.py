@@ -68,7 +68,17 @@ class Pipeline:
             counts["ocr"] += int(doc.source.value == "ocr")
             counts["flagged"] += int(doc.needs_review)
             counts["errors"] += int(bool(doc.error))
-            self.reporter.update(done, total, last, dict(counts))
+            # a compact record of the doc that just finished — feeds the live
+            # "what's happening" activity feed in the desktop/web UI
+            note = {
+                "file": doc.filename,
+                "type": doc.doc_type.value,
+                "source": doc.source.value,
+                "conf": round(doc.confidence, 2),
+                "flags": len(doc.flags),
+                "error": bool(doc.error),
+            }
+            self.reporter.update(done, total, last, dict(counts), note)
 
         results: list[Document] = list(docs)
         if self.workers == 1:

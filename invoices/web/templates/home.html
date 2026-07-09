@@ -1,0 +1,166 @@
+{% extends "base.html" %}
+{% block title %}Invoice → GSTR Linker{% endblock %}
+{% block body %}
+
+<!-- 1 · SETUP ------------------------------------------------------------- -->
+<div id="setup" style="display:none">
+  <h1>Scan invoices &amp; link to GSTR-2A</h1>
+  <p class="muted">Pick the folder holding your <span class="mono">FY&nbsp;..</span> invoice tree and,
+     optionally, a GSTR-2A workbook to link into. Everything runs locally on your machine.</p>
+  <div id="err" class="banner bad" style="display:none"></div>
+  <div class="card" style="max-width:860px">
+    <label>1 · Invoice folder</label>
+    <div class="flex" style="gap:10px;align-items:center">
+      <div class="col"><input id="inv" placeholder="/path/to/FY 22-23 tree" autocomplete="off"></div>
+      <button class="btn ghost" id="inv-browse" type="button">Browse…</button>
+    </div>
+    <div style="height:14px"></div>
+    <label>2 · GSTR-2A workbook <span class="muted">(optional — leave blank to only detect &amp; extract)</span></label>
+    <div class="flex" style="gap:10px;align-items:center">
+      <div class="col"><input id="gstr" placeholder="/path/to/GSTR2A_Return.xlsx" autocomplete="off"></div>
+      <button class="btn ghost" id="gstr-browse" type="button">Browse…</button>
+    </div>
+    <div style="height:18px"></div>
+    <button class="btn big" id="run">▶ Run</button>
+    <span class="muted" id="type-hint" style="margin-left:12px;display:none">Tip: paste the full path into the box.</span>
+  </div>
+</div>
+
+<!-- 2 · LIVE -------------------------------------------------------------- -->
+<div id="live" style="display:none">
+  <h1><span class="spin"></span> <span id="phase-label">Scanning invoices…</span></h1>
+  <div class="muted" id="live-sub" style="margin-bottom:14px">Starting…</div>
+  <div class="bar" style="height:10px"><span id="bar" style="width:0%"></span></div>
+  <div class="flex" style="justify-content:space-between;margin-top:6px">
+    <span class="muted mono" id="progress-text">0 / 0</span>
+    <span class="muted mono" id="pct-text">0%</span>
+  </div>
+  <div id="chips" class="grid cards" style="margin:16px 0"></div>
+  <h2>Live activity <span class="muted">— what the pipeline is doing, newest first</span></h2>
+  <div class="feed" id="feed"><div class="row"><span class="muted">waiting for the first document…</span></div></div>
+</div>
+
+<!-- 3 · DONE -------------------------------------------------------------- -->
+<div id="done" style="display:none">
+  <h1>✓ Scan complete</h1>
+  <div id="done-sub" class="muted" style="margin-bottom:16px"></div>
+  <div id="done-cards" class="grid cards" style="margin-bottom:14px"></div>
+  <div id="link-line" class="muted" style="margin-bottom:18px"></div>
+  <div class="flex" style="gap:12px;flex-wrap:wrap">
+    <a class="btn big" id="go-review" href="/review">Review flagged →</a>
+    <a class="btn big ghost" href="/dashboard">Open dashboard</a>
+    <button class="btn big ghost" id="open-out" type="button" style="display:none">Open output folder</button>
+    <button class="btn big ghost" id="again" type="button">Run another</button>
+  </div>
+</div>
+
+<script>
+const INIT = {{ state|tojson }};
+const $ = id => document.getElementById(id);
+const hasNative = () => !!(window.pywebview && window.pywebview.api);
+const esc = s => { const d = document.createElement("div"); d.textContent = (s==null?"":s); return d.innerHTML; };
+
+function show(section){
+  for(const s of ["setup","live","done"]) $(s).style.display = (s===section) ? "block" : "none";
+}
+function showErr(m){ $("err").textContent = m; $("err").style.display = "block"; }
+
+// ---- native file dialogs (pywebview) or typed paths (browser fallback) ----
+$("inv-browse").onclick = async () => {
+  if(hasNative()){ const p = await window.pywebview.api.pick_folder(); if(p) $("inv").value = p; }
+  else $("inv").focus();
+};
+$("gstr-browse").onclick = async () => {
+  if(hasNative()){ const p = await window.pywebview.api.pick_gstr(); if(p) $("gstr").value = p; }
+  else $("gstr").focus();
+};
+
+// ---- run -----------------------------------------------------------------
+$("run").onclick = async () => {
+  const invoice = $("inv").value.trim();
+  $("err").style.display = "none";
+  if(!invoice){ showErr("Choose the invoice folder first."); return; }
+  $("run").disabled = true;
+  try{
+    const r = await fetch("/api/start", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({invoice, gstr: $("gstr").value.trim()})});
+    const j = await r.json();
+    if(!j.ok){ showErr(j.error || "Could not start the run."); $("run").disabled = false; return; }
+    show("live"); poll();
+  }catch(e){ showErr(String(e)); $("run").disabled = false; }
+};
+$("again").onclick = () => { show("setup"); $("run").disabled = false; };
+
+// ---- live rendering ------------------------------------------------------
+const dotClass = n => n.error ? "bad" : (n.type === "invoice" ? (n.flags ? "warn" : "ok") : "info");
+function renderFeed(recent){
+  if(!recent || !recent.length) return;
+  $("feed").innerHTML = recent.map(n => {
+    const bits = [n.type, n.source, "conf " + (n.conf!=null ? n.conf : "–")];
+    if(n.flags) bits.push(n.flags + " flag" + (n.flags>1 ? "s" : ""));
+    return `<div class="row"><span class="dot ${dotClass(n)}"></span>`+
+           `<span class="name">${esc(n.file)}</span>`+
+           `<span class="muted">${bits.join(" · ")}</span></div>`;
+  }).join("");
+}
+function renderChips(counts){
+  const order = [["pdfs","PDFs"],["invoices","Invoices"],["approvals","Approvals"],
+                 ["ocr","Via OCR"],["flagged","Flagged"],["errors","Errors"]];
+  const rows = order.filter(([k]) => counts && (k in counts));
+  if(rows.length) $("chips").innerHTML = rows.map(([k,label]) =>
+    `<div class="card"><div class="k">${label}</div><div class="v">${counts[k]}</div></div>`).join("");
+}
+
+let polling = false;
+async function poll(){
+  if(polling) return; polling = true;
+  try{
+    const [s, rs] = await Promise.all([
+      fetch("/status").then(r=>r.json()),
+      fetch("/run_state").then(r=>r.json()),
+    ]);
+    $("bar").style.width = (s.pct||0) + "%";
+    $("progress-text").textContent = (s.done||0) + " / " + (s.total||0);
+    $("pct-text").textContent = (s.pct||0) + "%";
+    if(s.current) $("live-sub").textContent = "processing " + s.current;
+    renderChips(s.counts);
+    renderFeed(s.recent);
+    if(rs.phase === "linking") $("phase-label").textContent = "Linking to GSTR-2A…";
+    else if(rs.phase === "scanning") $("phase-label").textContent = "Scanning invoices…";
+    if(rs.phase === "done"){ finishDone(rs); polling = false; return; }
+    if(rs.phase === "error"){ show("setup"); showErr(rs.error || "Run failed."); $("run").disabled = false; polling = false; return; }
+  }catch(e){ /* transient — keep polling */ }
+  polling = false;
+  setTimeout(poll, 500);
+}
+
+function finishDone(rs){
+  const sm = rs.summary || {};
+  $("done-cards").innerHTML = [
+    ["PDFs", sm.total_pdfs], ["Invoices", sm.invoices], ["Flagged", sm.flagged],
+    ["Via OCR", sm.ocr_docs], ["Avg confidence", sm.avg_invoice_confidence],
+  ].map(([k,v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v==null?"–":v}</div></div>`).join("");
+  $("go-review").textContent = (sm.flagged||0) ? `Review ${sm.flagged} flagged →` : "Open review queue →";
+  if(rs.link){
+    const l = rs.link;
+    $("link-line").textContent = `GSTR-2A: linked ${l.matched}/${l.total} rows`
+      + (l.not_found ? `, ${l.not_found} not found` : "")
+      + (l.ambiguous ? `, ${l.ambiguous} ambiguous` : "") + ".";
+  }
+  if(hasNative()){
+    $("open-out").style.display = "inline-block";
+    $("open-out").onclick = () => window.pywebview.api.open_output();
+  }
+  show("done");
+}
+
+// ---- bootstrap from server-rendered state --------------------------------
+(function(){
+  if(!hasNative()) $("type-hint").style.display = "inline";
+  const p = INIT.phase;
+  if(p === "scanning" || p === "linking"){ show("live"); poll(); }
+  else if(p === "done"){ finishDone(INIT); }
+  else { show("setup"); if(p === "error" && INIT.error) showErr(INIT.error); }
+})();
+</script>
+{% endblock %}
