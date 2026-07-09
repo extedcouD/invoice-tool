@@ -64,6 +64,26 @@ def cmd_export(args) -> None:
     print(f"wrote {path}  ({len(result.invoices())} invoices, {len(result.flagged())} flagged)")
 
 
+def cmd_link_gstr(args) -> None:
+    from .io.gstr import link_gstr
+
+    store = _resolve_run(args)
+    result = store.load()
+    rep = link_gstr(result, Path(args.gstr), store,
+                    sheet_name=args.sheet, ref_header=args.ref_column)
+    print(f"\nlinked {rep.matched}/{rep.total} B2B rows "
+          f"({rep.not_found} NOT FOUND, {rep.ambiguous} ambiguous, "
+          f"{rep.copy_failed} copy-failed)")
+    print(f"  workbook: {rep.out_path}")
+    print(f"  invoices: {rep.flat_dir}  ({rep.matched} files)")
+    if rep.duplicate_filings:
+        print(f"  note: {rep.duplicate_filings} row(s) matched a duplicate-filed invoice")
+    if rep.unreferenced_invoices:
+        print(f"  note: {rep.unreferenced_invoices} detected invoice(s) had no B2B row")
+    for row, gstin, invno in rep.unmatched_rows:
+        print(f"    NOT FOUND  row {row}: {gstin or '-'}  {invno or '-'}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="invoices", description="Invoice detection & linking")
     p.add_argument("--out", default="out", type=Path, help="output root (default: ./out)")
@@ -89,6 +109,16 @@ def build_parser() -> argparse.ArgumentParser:
     ex = sub.add_parser("export", help="(re)write master xlsx from a run")
     ex.add_argument("--run", help="run dir (default: latest under --out)")
     ex.set_defaults(func=cmd_export)
+
+    from .io.gstr import DEFAULT_REF_HEADER, DEFAULT_SHEET
+    lk = sub.add_parser("link-gstr",
+                        help="link detected invoices into a GSTR-2A B2B sheet + flatten PDFs")
+    lk.add_argument("--run", help="run dir (default: latest under --out)")
+    lk.add_argument("--gstr", required=True, help="path to the GSTR-2A return .xlsx template")
+    lk.add_argument("--sheet", default=DEFAULT_SHEET, help="B2B sheet name")
+    lk.add_argument("--ref-column", default=DEFAULT_REF_HEADER,
+                    help="header for the new invoice-reference column")
+    lk.set_defaults(func=cmd_link_gstr)
     return p
 
 

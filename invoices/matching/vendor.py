@@ -35,3 +35,17 @@ def score(a: str | None, b: str | None) -> float:
     if na == nb:
         return 100.0
     return float(fuzz.token_set_ratio(na, nb))
+
+
+def norm_id(s: str | None) -> str:
+    """Normalize an invoice number/id for cross-format equality.
+
+    Strips everything but alphanumerics and lowercases, so slash- and dash-style
+    ids collapse to the same key: 'APEX/22-23/003' and 'APEX-22-23-003' -> 'apex2223003'.
+    """
+    return re.sub(r"[^a-z0-9]", "", s.lower()) if s else ""
+
+
+def norm_gstin(s: str | None) -> str:
+    """Normalize a GSTIN for equality (uppercase, alphanumerics only)."""
+    return re.sub(r"[^A-Z0-9]", "", s.upper()) if s else ""

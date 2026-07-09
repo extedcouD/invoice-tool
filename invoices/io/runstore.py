@@ -46,8 +46,17 @@ class RunStore:
     def review_dir(self) -> Path:
         return self.dir / "review_pdfs"
 
+    @property
+    def linked_dir(self) -> Path:
+        """Flat folder holding the invoices referenced by a linked GST return."""
+        return self.dir / "linked_invoices"
+
     def master_path(self) -> Path:
         return self.dir / f"master_{self.run_id}.xlsx"
+
+    def gstr_linked_path(self, template_path: Path | str) -> Path:
+        """Output workbook for `link-gstr`: '<template-stem>_linked.xlsx' in the run dir."""
+        return self.dir / f"{Path(template_path).stem}_linked.xlsx"
 
     # ---- (de)serialize -----------------------------------------------------
     def save(self, result: RunResult) -> Path:

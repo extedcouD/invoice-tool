@@ -9,17 +9,11 @@ invoice date (seen in the sample: invoice 06-Sep, paid/foldered 24-Sep).
 """
 from __future__ import annotations
 
-import re
-
 from ..config import Settings, DEFAULTS
 from ..core.interfaces import Stage
 from ..core.models import Document, DocType, Severity
 from ..matching import vendor
 from ..observability.events import record
-
-
-def _norm_id(s: str | None) -> str:
-    return re.sub(r"[^a-z0-9]", "", s.lower()) if s else ""
 
 
 class ReconcileStage(Stage):
@@ -57,7 +51,7 @@ class ReconcileStage(Stage):
 
         # --- filename id vs content invoice-no ---------------------------
         if f.invoice_id and f.invoice_no_content:
-            if _norm_id(f.invoice_id) != _norm_id(f.invoice_no_content):
+            if vendor.norm_id(f.invoice_id) != vendor.norm_id(f.invoice_no_content):
                 doc.add_flag("id_mismatch",
                              f"filename id '{f.invoice_id}' vs PDF '{f.invoice_no_content}'")
                 record(doc, self.name, "id_mismatch",

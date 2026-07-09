@@ -1,0 +1,61 @@
+name: build-desktop-apps
+
+# Builds the double-click desktop app for macOS and Windows in the cloud, so no
+# local Windows machine is needed. Run it from the repo's Actions tab
+# (Run workflow), or it runs automatically when you push a tag like v1.0.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-13 = Intel build; runs on Intel Macs natively and on Apple
+          # Silicon via Rosetta, so one Mac artifact covers both.
+          - os: macos-13
+            artifact: InvoiceGSTRLinker-macOS
+          - os: windows-latest
+            artifact: InvoiceGSTRLinker-Windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tesseract (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tesseract
+
+      - name: Install tesseract (Windows)
+        if: runner.os == 'Windows'
+        run: choco install tesseract -y --no-progress
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build app
+        run: pyinstaller packaging/InvoiceGSTRLinker.spec --noconfirm
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          zip -r "../${{ matrix.artifact }}.zip" InvoiceGSTRLinker.app
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path dist/InvoiceGSTRLinker/* -DestinationPath ${{ matrix.artifact }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+          if-no-files-found: error

@@ -136,7 +136,7 @@ class Settings:
     fuzzy_soft_flag: float = FUZZY_SOFT_FLAG
     amount_tolerance: float = AMOUNT_TOLERANCE
     review_confidence_threshold: float = REVIEW_CONFIDENCE_THRESHOLD
-    workers: int = 1  # >1 enables ProcessPool over documents
+    workers: int = 1  # >1 maps documents across a thread pool (OCR shells out to tesseract)
     ocr_enabled: bool = True
 
 

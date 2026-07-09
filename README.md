@@ -65,7 +65,7 @@ walk ─▶ Document(s) ─▶ [ extract ─▶ classify ─▶ parse ─▶ rec
 | layer         | dir                  | responsibility                                                   |
 | ------------- | -------------------- | ---------------------------------------------------------------- |
 | domain        | `core/models.py`     | `Document`, `Fields`, `Event`, `Flag`, `RunResult` (pydantic)    |
-| engine        | `core/pipeline.py`   | runs stages, times them, isolates faults, parallelizes (threads) |
+| engine        | `core/pipeline.py`   | runs stages, times them, isolates faults, maps documents across a thread pool (`--workers`) |
 | contracts     | `core/interfaces.py` | `Stage`, `TextSource` ABCs                                       |
 | extractors    | `extractors.py`      | default baseline + pluggable**per-vendor** field extractors      |
 | stages        | `stages/`            | walk · extract · classify · parse · reconcile · validate         |
