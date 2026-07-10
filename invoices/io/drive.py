@@ -130,7 +130,7 @@ class DriveClient:
                     raise DriveAuthError(
                         f"Google OAuth client secret not found at {secret}. Create a "
                         "'Desktop app' OAuth client in Google Cloud (Drive API enabled) "
-                        "and save its client_secret.json there."
+                        "and save its client_secret.json there. See docs/DRIVE_SETUP.md."
                     )
                 flow = InstalledAppFlow.from_client_secrets_file(str(secret), SCOPES)
                 creds = flow.run_local_server(port=0, open_browser=open_browser)
