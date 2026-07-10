@@ -47,6 +47,25 @@ SCOPES = [
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 PDF_MIME = "application/pdf"
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def folder_id_from(value: str) -> str:
+    """Accept a raw folder id or a Drive folder URL and return the id.
+
+    Handles ``https://drive.google.com/drive/folders/<id>?...`` and
+    ``...?id=<id>`` links, or a bare id.
+    """
+    import re
+
+    value = (value or "").strip()
+    m = re.search(r"/folders/([A-Za-z0-9_\-]+)", value)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([A-Za-z0-9_\-]+)", value)
+    if m:
+        return m.group(1)
+    return value
 
 # Transient Drive errors we retry with exponential backoff.
 _RETRY_STATUS = {403, 429, 500, 502, 503, 504}
@@ -202,6 +221,21 @@ class DriveClient:
             except OSError:
                 pass
             raise
+
+    def copy_file(self, file_id: str, parent_id: str,
+                  name: Optional[str] = None) -> str:
+        """Server-side copy of a Drive file into ``parent_id`` (no download/upload).
+
+        Lets us assemble the output invoice folder from the originals without
+        moving bytes over a slow link. Reads the source (drive.readonly) and
+        creates an app-owned copy (drive.file); the original is untouched.
+        """
+        body: dict = {"parents": [parent_id]}
+        if name:
+            body["name"] = name
+        created = self._execute(self._svc.files().copy(
+            fileId=file_id, body=body, fields="id", supportsAllDrives=True))
+        return created["id"]
 
     def create_folder(self, name: str, parent_id: Optional[str] = None) -> str:
         meta = {"name": name, "mimeType": FOLDER_MIME}

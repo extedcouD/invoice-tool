@@ -76,9 +76,26 @@ def create_app(controller: RunController) -> Flask:
         data = request.get_json(silent=True) or request.form
         invoice = (data.get("invoice") or "").strip()
         gstr = (data.get("gstr") or "").strip() or None
+        source_mode = (data.get("source_mode") or "local").strip()
+        upload_folder = (data.get("upload_folder") or "").strip() or None
         if not invoice:
-            return jsonify({"ok": False, "error": "Choose the invoice folder first."}), 400
-        res = controller.start(invoice, gstr)
+            where = ("Google Drive folder" if source_mode == "drive"
+                     else "invoice folder")
+            return jsonify({"ok": False, "error": f"Choose the {where} first."}), 400
+        res = controller.start(invoice, gstr, source_mode=source_mode,
+                               upload_folder_name=upload_folder)
+        return jsonify(res), (200 if res.get("ok") else 400)
+
+    @app.route("/api/drive/auth", methods=["POST"])
+    def api_drive_auth():
+        """Sign in to Google Drive (opens the system browser for consent)."""
+        res = controller.authenticate_drive()
+        return jsonify(res), (200 if res.get("ok") else 400)
+
+    @app.route("/api/drive/upload", methods=["POST"])
+    def api_drive_upload():
+        """Publish the master + detected invoices to a new Drive folder."""
+        res = controller.upload_results()
         return jsonify(res), (200 if res.get("ok") else 400)
 
     @app.route("/api/docs")

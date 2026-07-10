@@ -45,6 +45,7 @@
   .btn{display:inline-block;background:var(--accent);color:#04131f;font-weight:700;
     border:none;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px}
   .btn.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+  .btn.ghost.sel{border-color:var(--accent);color:var(--accent);font-weight:700}
   .btn:disabled{opacity:.5;cursor:not-allowed}
   .btn.big{padding:11px 20px;font-size:14px}
   /* live activity feed */
@@ -60,7 +61,8 @@
     border-top-color:var(--accent);display:inline-block;vertical-align:-2px;
     animation:spin .8s linear infinite}
   @keyframes spin{to{transform:rotate(360deg)}}
-  .banner{border-radius:10px;padding:10px 14px;margin-bottom:14px;font-weight:600}
+  .banner{border-radius:10px;padding:10px 14px;margin-bottom:14px;font-weight:600;
+    background:rgba(63,179,127,.12);color:var(--ok);border:1px solid rgba(63,179,127,.4)}
   .banner.bad{background:rgba(229,96,95,.12);color:var(--bad);border:1px solid rgba(229,96,95,.4)}
   input,select{background:var(--panel2);border:1px solid var(--line);color:var(--ink);
     border-radius:7px;padding:7px 9px;font-size:13px;width:100%}

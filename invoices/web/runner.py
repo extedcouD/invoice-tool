@@ -21,6 +21,7 @@ import json
 import threading
 import traceback
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import Any, Optional
 
@@ -44,43 +45,90 @@ class RunController:
         self.link_report = None
         self.gstr_path: Optional[Path] = None   # remembered for post-review linking
         self._thread: Optional[threading.Thread] = None
+        # ---- Google Drive source/sink (Phase 3) ----
+        self.source_mode: str = "local"    # local | drive
+        self.drive = None                  # DriveClient once signed in
+        self.resumed: bool = False         # this run reopened an interrupted one
+        self.upload_folder_name: Optional[str] = None
+        self.upload_report: Optional[dict] = None
+
+    # ---- Google Drive auth -------------------------------------------------
+    def authenticate_drive(self, open_browser: bool = True) -> dict:
+        """Run (or refresh) Google Drive OAuth. Returns {ok} or {ok:False,error}."""
+        try:
+            from ..io.drive import DriveClient
+            self.drive = DriveClient.authenticate(open_browser=open_browser)
+            return {"ok": True}
+        except Exception as exc:  # missing client_secret / declined consent / offline
+            return {"ok": False, "error": str(exc)}
 
     # ---- lifecycle ---------------------------------------------------------
     @property
     def busy(self) -> bool:
         return self.phase in ("scanning", "linking")
 
-    def start(self, invoice_root: str | Path, gstr_path: str | Path | None) -> dict:
-        """Validate inputs and kick off scan(+link) on a background thread.
+    def start(self, invoice_root: str | Path, gstr_path: str | Path | None,
+              source_mode: str = "local",
+              upload_folder_name: str | None = None) -> dict:
+        """Validate inputs and kick off scan on a background thread.
 
-        Returns immediately with ``{ok, run_id}`` or ``{ok: False, error}``; the
-        UI then polls :meth:`status` / :meth:`run_state` for progress.
+        ``source_mode`` is "local" (a filesystem folder) or "drive" (a Google
+        Drive folder id/URL, using the already-authenticated client). If an
+        interrupted run for the same input exists, it is **reopened and resumed**
+        rather than restarted. Returns immediately with ``{ok, run_id, resumed}``.
         """
         with self._lock:
             if self.busy:
                 return {"ok": False, "error": "A run is already in progress."}
-            inv = Path(str(invoice_root)).expanduser()
-            if not inv.exists() or not inv.is_dir():
-                return {"ok": False, "error": f"Invoice folder not found: {inv}"}
+
+            self.source_mode = source_mode
+            self.upload_folder_name = (upload_folder_name or "").strip() or None
             gstr = Path(str(gstr_path)).expanduser() if gstr_path else None
             if gstr is not None and not gstr.exists():
                 return {"ok": False, "error": f"GSTR-2A file not found: {gstr}"}
-            # Pre-create the run dir NOW so /status can poll status.json from t=0.
-            self.store = RunStore.new(self.output_root)
+
+            if source_mode == "drive":
+                if self.drive is None:
+                    return {"ok": False, "error": "Connect Google Drive first."}
+                from ..io.drive import DriveFileSource, folder_id_from, walk_drive
+                folder_id = folder_id_from(str(invoice_root))
+                if not folder_id:
+                    return {"ok": False, "error": "Enter a Google Drive folder link or id."}
+                root: Any = folder_id
+                root_key = f"drive:{folder_id}"
+                file_source: Any = DriveFileSource(self.drive)
+                walker: Any = partial(walk_drive, client=self.drive)
+            else:
+                inv = Path(str(invoice_root)).expanduser()
+                if not inv.exists() or not inv.is_dir():
+                    return {"ok": False, "error": f"Invoice folder not found: {inv}"}
+                root = inv
+                root_key = str(inv.resolve())
+                file_source = None
+                walker = None
+
+            # Resume an interrupted run for the same input, else mint a fresh one.
+            existing = RunStore.find_resumable(self.output_root, root_key)
+            self.store = existing or RunStore.new(self.output_root)
+            self.resumed = existing is not None
             self.result = None
             self.link_report = None
+            self.upload_report = None
             self.gstr_path = gstr           # linked later, after review (see link_now)
             self.error = None
             self.phase = "scanning"
             self._thread = threading.Thread(
-                target=self._run, args=(inv,), daemon=True)
+                target=self._run, args=(root, root_key, file_source, walker),
+                daemon=True)
             self._thread.start()
-            return {"ok": True, "run_id": self.store.run_id}
+            return {"ok": True, "run_id": self.store.run_id, "resumed": self.resumed}
 
-    def _run(self, invoice_root: Path) -> None:
+    def _run(self, root, root_key, file_source, walker) -> None:
         try:
-            store, result = run_scan(invoice_root, self.output_root,
-                                     self.settings, quiet=True, store=self.store)
+            store, result = run_scan(root, self.output_root, self.settings,
+                                     quiet=True, store=self.store,
+                                     file_source=file_source, walker=walker,
+                                     root_key=root_key)
             with self._lock:
                 self.store, self.result = store, result
                 self.phase = "done"
@@ -96,6 +144,38 @@ class RunController:
                 (self.output_root / "last_error.txt").write_text(traceback.format_exc())
             except OSError:
                 pass
+
+    def upload_results(self) -> dict:
+        """Publish outputs to a NEW Google Drive folder (drive mode only).
+
+        Creates ``<name>/`` with the master workbook plus an ``invoices/``
+        subfolder of the detected invoices — the latter assembled with
+        server-side ``files.copy`` so invoice bytes never leave Drive. The input
+        tree is only ever read, never modified.
+        """
+        if self.source_mode != "drive" or self.drive is None \
+                or self.result is None or self.store is None:
+            return {"ok": False, "error": "No Drive run to upload."}
+        try:
+            from ..io.drive import XLSX_MIME
+            name = self.upload_folder_name or f"InvoiceLinker {self.store.run_id}"
+            folder_id = self.drive.create_folder(name)
+            master = self.store.master_path()
+            if master.exists():
+                self.drive.upload_file(master, folder_id, mime=XLSX_MIME)
+            inv_folder = self.drive.create_folder("invoices", folder_id)
+            copied = 0
+            for d in self.result.invoices():
+                if d.drive_file_id:
+                    self.drive.copy_file(d.drive_file_id, inv_folder, name=d.filename)
+                    copied += 1
+            report = {"ok": True, "folder": name, "folder_id": folder_id,
+                      "invoices": copied}
+        except Exception as exc:
+            report = {"ok": False, "error": str(exc)}
+        with self._lock:
+            self.upload_report = report
+        return report
 
     def link_now(self) -> Optional[Any]:
         """Run GSTR-2A linking for the (possibly reviewed) result, on demand.
@@ -134,6 +214,9 @@ class RunController:
                 "run_id": self.store.run_id if self.store else None,
                 "output_dir": str(self.store.dir) if self.store else None,
                 "has_gstr": self.gstr_path is not None,
+                "source_mode": self.source_mode,
+                "drive_signed_in": self.drive is not None,
+                "resumed": self.resumed,
             }
             if self.result is not None:
                 st["summary"] = self.result.summary()
@@ -141,4 +224,6 @@ class RunController:
                 r = self.link_report
                 st["link"] = {"matched": r.matched, "total": r.total,
                               "not_found": r.not_found, "ambiguous": r.ambiguous}
+            if self.upload_report is not None:
+                st["upload"] = self.upload_report
         return st

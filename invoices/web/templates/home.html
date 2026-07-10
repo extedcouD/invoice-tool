@@ -5,21 +5,48 @@
 <!-- 1 · SETUP ------------------------------------------------------------- -->
 <div id="setup" style="display:none">
   <h1>Scan invoices &amp; link to GSTR-2A</h1>
-  <p class="muted">Pick the folder holding your <span class="mono">FY&nbsp;..</span> invoice tree and,
-     optionally, a GSTR-2A workbook to link into. Everything runs locally on your machine.</p>
+  <p class="muted">Scan a <span class="mono">FY&nbsp;..</span> invoice tree — from a local folder or
+     straight from <b>Google Drive</b> — and optionally link a GSTR-2A workbook.</p>
   <div id="err" class="banner bad" style="display:none"></div>
   <div class="card" style="max-width:860px">
-    <label>1 · Invoice folder</label>
-    <div class="flex" style="gap:10px;align-items:center">
-      <div class="col"><input id="inv" placeholder="/path/to/FY 22-23 tree" autocomplete="off"></div>
-      <button class="btn ghost" id="inv-browse" type="button">Browse…</button>
+    <label>Source</label>
+    <div class="flex" style="gap:8px;align-items:center;margin-bottom:14px">
+      <button class="btn ghost sel" id="src-local" type="button">💻 Local folder</button>
+      <button class="btn ghost" id="src-drive" type="button">☁️ Google Drive</button>
     </div>
-    <div style="height:14px"></div>
-    <label>2 · GSTR-2A workbook <span class="muted">(optional — leave blank to only detect &amp; extract)</span></label>
-    <div class="flex" style="gap:10px;align-items:center">
-      <div class="col"><input id="gstr" placeholder="/path/to/GSTR2A_Return.xlsx" autocomplete="off"></div>
-      <button class="btn ghost" id="gstr-browse" type="button">Browse…</button>
+
+    <!-- Local source ---------------------------------------------------- -->
+    <div id="local-fields">
+      <label>1 · Invoice folder</label>
+      <div class="flex" style="gap:10px;align-items:center">
+        <div class="col"><input id="inv" placeholder="/path/to/FY 22-23 tree" autocomplete="off"></div>
+        <button class="btn ghost" id="inv-browse" type="button">Browse…</button>
+      </div>
+      <div style="height:14px"></div>
+      <label>2 · GSTR-2A workbook <span class="muted">(optional — leave blank to only detect &amp; extract)</span></label>
+      <div class="flex" style="gap:10px;align-items:center">
+        <div class="col"><input id="gstr" placeholder="/path/to/GSTR2A_Return.xlsx" autocomplete="off"></div>
+        <button class="btn ghost" id="gstr-browse" type="button">Browse…</button>
+      </div>
     </div>
+
+    <!-- Drive source ---------------------------------------------------- -->
+    <div id="drive-fields" style="display:none">
+      <div id="drive-connect">
+        <button class="btn" id="drive-auth" type="button">🔗 Connect Google Drive</button>
+        <span class="muted" style="margin-left:10px">Opens your browser to sign in. Results are written to a
+          <b>new</b> Drive folder — your originals are never touched.</span>
+      </div>
+      <div id="drive-connected" style="display:none">
+        <div class="banner" style="margin-bottom:12px">✓ Connected to Google Drive.</div>
+        <label>1 · Invoice folder on Drive <span class="muted">(paste the folder link or id)</span></label>
+        <input id="drive-folder" placeholder="https://drive.google.com/drive/folders/…  or  <folderId>" autocomplete="off">
+        <div style="height:14px"></div>
+        <label>2 · Output folder name <span class="muted">(a new folder created in your Drive)</span></label>
+        <input id="drive-out" placeholder="InvoiceLinker results" autocomplete="off">
+      </div>
+    </div>
+
     <div style="height:18px"></div>
     <button class="btn big" id="run">▶ Run</button>
     <span class="muted" id="type-hint" style="margin-left:12px;display:none">Tip: paste the full path into the box.</span>
@@ -46,9 +73,11 @@
   <div id="done-sub" class="muted" style="margin-bottom:16px"></div>
   <div id="done-cards" class="grid cards" style="margin-bottom:14px"></div>
   <div id="link-line" class="muted" style="margin-bottom:18px"></div>
+  <div id="upload-line" class="muted" style="margin-bottom:14px"></div>
   <div class="flex" style="gap:12px;flex-wrap:wrap">
     <a class="btn big" id="go-review" href="/review">Review flagged →</a>
     <a class="btn big ghost" href="/dashboard">Open dashboard</a>
+    <button class="btn big" id="drive-upload" type="button" style="display:none">☁️ Upload results to Drive</button>
     <button class="btn big ghost" id="open-out" type="button" style="display:none">Open output folder</button>
     <button class="btn big ghost" id="again" type="button">Run another</button>
   </div>
@@ -65,6 +94,31 @@ function show(section){
 }
 function showErr(m){ $("err").textContent = m; $("err").style.display = "block"; }
 
+// ---- source mode (local vs Google Drive) ---------------------------------
+let sourceMode = "local";
+let driveConnected = false;
+function setMode(m){
+  sourceMode = m;
+  $("src-local").classList.toggle("sel", m==="local");
+  $("src-drive").classList.toggle("sel", m==="drive");
+  $("local-fields").style.display = (m==="local") ? "block" : "none";
+  $("drive-fields").style.display = (m==="drive") ? "block" : "none";
+}
+$("src-local").onclick = () => setMode("local");
+$("src-drive").onclick = () => setMode("drive");
+
+$("drive-auth").onclick = async () => {
+  $("err").style.display = "none";
+  $("drive-auth").disabled = true; $("drive-auth").textContent = "Connecting…";
+  try{
+    const r = await fetch("/api/drive/auth", {method:"POST"});
+    const j = await r.json();
+    if(!j.ok){ showErr(j.error || "Could not connect to Google Drive."); }
+    else { driveConnected = true; $("drive-connect").style.display="none"; $("drive-connected").style.display="block"; }
+  }catch(e){ showErr(String(e)); }
+  $("drive-auth").disabled = false; $("drive-auth").textContent = "🔗 Connect Google Drive";
+};
+
 // ---- native file dialogs (pywebview) or typed paths (browser fallback) ----
 $("inv-browse").onclick = async () => {
   if(hasNative()){ const p = await window.pywebview.api.pick_folder(); if(p) $("inv").value = p; }
@@ -77,15 +131,25 @@ $("gstr-browse").onclick = async () => {
 
 // ---- run -----------------------------------------------------------------
 $("run").onclick = async () => {
-  const invoice = $("inv").value.trim();
   $("err").style.display = "none";
-  if(!invoice){ showErr("Choose the invoice folder first."); return; }
+  let payload;
+  if(sourceMode === "drive"){
+    if(!driveConnected){ showErr("Connect Google Drive first."); return; }
+    const folder = $("drive-folder").value.trim();
+    if(!folder){ showErr("Paste the Google Drive folder link or id."); return; }
+    payload = {source_mode:"drive", invoice: folder, upload_folder: $("drive-out").value.trim()};
+  } else {
+    const invoice = $("inv").value.trim();
+    if(!invoice){ showErr("Choose the invoice folder first."); return; }
+    payload = {source_mode:"local", invoice, gstr: $("gstr").value.trim()};
+  }
   $("run").disabled = true;
   try{
     const r = await fetch("/api/start", {method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({invoice, gstr: $("gstr").value.trim()})});
+      body: JSON.stringify(payload)});
     const j = await r.json();
     if(!j.ok){ showErr(j.error || "Could not start the run."); $("run").disabled = false; return; }
+    if(j.resumed) $("phase-label").textContent = "Resuming previous scan…";
     show("live"); poll();
   }catch(e){ showErr(String(e)); $("run").disabled = false; }
 };
@@ -153,6 +217,31 @@ function finishDone(rs){
   if(hasNative()){
     $("open-out").style.display = "inline-block";
     $("open-out").onclick = () => window.pywebview.api.open_output();
+  }
+  // Drive: offer to publish results to a new Drive folder.
+  if(rs.source_mode === "drive"){
+    const btn = $("drive-upload");
+    if(rs.upload && rs.upload.ok){
+      $("upload-line").textContent = `☁️ Uploaded to Drive folder “${rs.upload.folder}” `
+        + `(${rs.upload.invoices} invoice${rs.upload.invoices===1?"":"s"} + master workbook).`;
+      btn.style.display = "none";
+    } else {
+      btn.style.display = "inline-block";
+      btn.disabled = false; btn.textContent = "☁️ Upload results to Drive";
+      btn.onclick = async () => {
+        btn.disabled = true; btn.textContent = "Uploading…";
+        try{
+          const r = await fetch("/api/drive/upload", {method:"POST"});
+          const j = await r.json();
+          if(j.ok){ $("upload-line").textContent =
+              `☁️ Uploaded to Drive folder “${j.folder}” (${j.invoices} invoices + master workbook).`;
+            btn.style.display = "none"; }
+          else { $("upload-line").textContent = "Upload failed: " + (j.error||"unknown error");
+            btn.disabled = false; btn.textContent = "☁️ Retry upload"; }
+        }catch(e){ $("upload-line").textContent = "Upload failed: " + e;
+          btn.disabled = false; btn.textContent = "☁️ Retry upload"; }
+      };
+    }
   }
   show("done");
 }
