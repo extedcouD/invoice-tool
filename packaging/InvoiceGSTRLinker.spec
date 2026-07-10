@@ -81,6 +81,25 @@ from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 datas += collect_data_files("webview")
 hiddenimports = ["pytesseract"] + collect_submodules("webview")
 
+# Google Drive backend (invoices/io/drive.py): the OAuth + Drive API libraries
+# import backends lazily, so pull their submodules in. We target google.auth /
+# google.oauth2 (not the whole `google` namespace) to avoid dragging in the
+# grpc-dependent google.api_core paths we don't use.
+hiddenimports += (
+    collect_submodules("google.auth")
+    + collect_submodules("google.oauth2")
+    + collect_submodules("google_auth_oauthlib")
+    + collect_submodules("googleapiclient")
+    + ["google_auth_httplib2", "httplib2", "uritemplate"]
+)
+# With static_discovery=True the Drive client reads the bundled discovery doc
+# instead of fetching it — ship just drive.v3.json (not all ~560 services).
+import googleapiclient
+_gac = Path(googleapiclient.__file__).resolve().parent / "discovery_cache" / "documents"
+_drive_doc = _gac / "drive.v3.json"
+if _drive_doc.exists():
+    datas.append((str(_drive_doc), "googleapiclient/discovery_cache/documents"))
+
 a = Analysis(
     [str(ROOT / "run_gui.py")],
     pathex=[str(ROOT)],

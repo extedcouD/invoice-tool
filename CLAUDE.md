@@ -4,11 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`invoices` is a **local, no-cloud** tool that walks a human-maintained folder tree of
+`invoices` is a tool that walks a human-maintained folder tree of
 Kotak-bank payment PDFs, decides which PDFs are invoices (vs approvals / GSTR-2A / junk),
 links each to its company + id, extracts a Phase-1 field subset, and writes a master Excel —
 with a Flask review app for low-confidence cases. Scope is deliberately narrow: **detect +
 link only**. No line-item parsing, no financial analysis, bank scope hard-coded to Kotak.
+
+The default source is a **local** folder, but the desktop app can also read the tree
+**directly from Google Drive** and publish results back to a new Drive folder (see the
+FileSource seam + `io/drive.py` below). Large scans **checkpoint and resume**, so a run over a
+120 GB Drive tree survives interruption.
 
 ## Commands
 
@@ -69,6 +74,17 @@ Key structural facts (each requires reading several files to reconstruct):
   `doc_type == INVOICE` — except `parse` always sets `invoice_id` from the filename first.
 - **The run directory is the single source of truth.** `review` and `export` load
   `detections.json` and never re-scan. `RunStore` (`io/runstore.py`) owns the layout.
+- **Where the bytes come from is abstracted (`FileSource`, `core/interfaces.py`).** `walk()`
+  seeds Documents for local paths; `extract` (`io/pdf.py`) calls `FileSource.materialize(doc)`
+  to get a *local* path before `fitz.open`, so OCR/parse never know the source. `LocalFileSource`
+  (`io/sources.py`) is a passthrough; `DriveFileSource` (`io/drive.py`) downloads each PDF to a
+  temp file. To scan Drive, `run_scan` takes a `walker=walk_drive` + `file_source=DriveFileSource`
+  — the pipeline is otherwise unchanged.
+- **Scans are resumable.** Each finished doc is appended to `checkpoint.jsonl` immediately;
+  `run_meta.json` marks a run complete. `RunStore.find_resumable()` reopens an interrupted run for
+  the same input, and `run_scan` skips sources already in the checkpoint (keyed by
+  `Document.source_key`), assembling the final `detections.json` from the full ledger. Fresh runs
+  behave exactly as before. This is what makes a multi-hour 120 GB Drive scan survivable.
 - **The desktop app (`gui.py`) hosts the web UI, it is not a separate UI.** It starts
   the Flask app (`web/app.py`) in a thread and shows it in a native pywebview window
   (browser fallback via `--web`). A shared `RunController` (`web/runner.py`) owns the
@@ -78,6 +94,12 @@ Key structural facts (each requires reading several files to reconstruct):
   written by `StatusWriter`) and `/run_state` (coarse phase) to drive one screen:
   setup → live activity feed → integrated review queue. Don't reintroduce a
   progress-less spinner — the live feed *is* the observability surface for end users.
+  The setup screen also offers a **Google Drive** source: "Connect Google Drive"
+  (`/api/drive/auth` → `RunController.authenticate_drive`, installed-app OAuth), a folder
+  link/id, and an output-folder name; on finish, `/api/drive/upload` publishes the master +
+  detected invoices to a new Drive folder (invoices via server-side `files.copy` — originals are
+  never modified). OAuth needs a user-supplied `client_secret.json` in the app-support dir
+  (`io/drive.app_support_dir()`); the frozen bundle can be smoke-tested with `--selftest`.
 - **Fault isolation.** `Pipeline.run_one` wraps each stage in try/except: a failure flags
   `stage_error` on that one doc and the run continues. Never let a stage crash the whole run.
 - **`workers > 1` uses a `ThreadPoolExecutor`, not processes.** OCR shells out to the

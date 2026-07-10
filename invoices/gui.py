@@ -144,9 +144,28 @@ def _run_cli(argv: list[str]) -> int:
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
+def _selftest() -> int:
+    """Verify the frozen bundle can load the Drive backend + its discovery doc.
+
+    Complements --cli (which exercises the pipeline): this catches missing
+    PyInstaller hidden-imports for the Google API libraries before a release,
+    without needing credentials or a network. Run: InvoiceGSTRLinker --selftest
+    """
+    from .io.drive import DriveClient, walk_drive, folder_id_from  # noqa: F401
+    from googleapiclient.discovery import build
+    # static_discovery reads the bundled drive.v3.json (no network, no auth).
+    build("drive", "v3", developerKey="selftest",
+          static_discovery=True, cache_discovery=False)
+    assert folder_id_from("https://drive.google.com/drive/folders/ABC123") == "ABC123"
+    print("selftest OK: drive backend imports + discovery doc load")
+    return 0
+
+
 def main() -> None:
     configure_bundled_tesseract()
     argv = sys.argv[1:]
+    if argv[:1] == ["--selftest"]:
+        raise SystemExit(_selftest())
     if argv[:1] == ["--cli"]:
         raise SystemExit(_run_cli(argv[1:]))
 
