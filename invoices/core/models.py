@@ -82,6 +82,13 @@ class Document(BaseModel):
     filename: str
     size_bytes: int = 0
 
+    # Stable identity of the source bytes, used to skip already-processed files
+    # when a scan resumes ("local:<abs-path>" or "drive:<fileId>@<modifiedTime>").
+    source_key: str = ""
+    # Set only when the source is Google Drive (used to fetch bytes on demand).
+    drive_file_id: Optional[str] = None
+    drive_modified_time: Optional[str] = None
+
     path_info: PathInfo = Field(default_factory=PathInfo)
     doc_type: DocType = DocType.UNKNOWN
     classify_score: float = 0.0

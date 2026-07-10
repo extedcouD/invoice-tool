@@ -12,7 +12,7 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Sequence
+from typing import Callable, Optional, Sequence
 
 from ..observability.events import CLOCK, record
 from ..observability.progress import Reporter
@@ -53,16 +53,27 @@ class Pipeline:
         return doc
 
     # ---- whole corpus ------------------------------------------------------
-    def run(self, docs: list[Document]) -> list[Document]:
+    def run(self, docs: list[Document],
+            on_doc_done: Optional[Callable[[Document], None]] = None,
+            start_done: int = 0, total: Optional[int] = None) -> list[Document]:
+        """Process ``docs`` through all stages.
+
+        ``on_doc_done`` (if given) is called with each finished Document as it
+        completes — used to append it to the resumable checkpoint. It runs on the
+        consuming thread (sequentially, even with workers>1), so it needs no lock.
+
+        ``start_done``/``total`` let a resumed run report progress against the
+        *whole* corpus (already-done + this batch), not just this batch.
+        """
         CLOCK.reset()
-        total = len(docs)
+        total = len(docs) if total is None else total
         self.reporter.start(total)
-        counts = {"pdfs": 0, "invoices": 0, "approvals": 0, "ocr": 0,
+        counts = {"pdfs": start_done, "invoices": 0, "approvals": 0, "ocr": 0,
                   "flagged": 0, "errors": 0}
         last = self.stages[-1].name if self.stages else "-"
 
         def tally(doc: Document, done: int) -> None:
-            counts["pdfs"] = done
+            counts["pdfs"] = start_done + done
             counts["invoices"] += int(doc.doc_type.value == "invoice")
             counts["approvals"] += int(doc.doc_type.value == "approval")
             counts["ocr"] += int(doc.source.value == "ocr")
@@ -78,7 +89,9 @@ class Pipeline:
                 "flags": len(doc.flags),
                 "error": bool(doc.error),
             }
-            self.reporter.update(done, total, last, dict(counts), note)
+            self.reporter.update(start_done + done, total, last, dict(counts), note)
+            if on_doc_done is not None:
+                on_doc_done(doc)
 
         results: list[Document] = list(docs)
         if self.workers == 1:

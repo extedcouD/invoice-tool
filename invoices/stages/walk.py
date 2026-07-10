@@ -82,11 +82,13 @@ def walk(root: Path, settings: Settings = DEFAULTS) -> list[Document]:
         info = _parse_path(folder_parts)
         info.bank = info.bank or bank
 
+        resolved = str(path.resolve())
         doc = Document(
             id=f"d{idx:05d}",
-            path=str(path.resolve()),
+            path=resolved,
             filename=path.name,
             size_bytes=path.stat().st_size,
+            source_key=f"local:{resolved}",   # stable id for resume skip-list
             path_info=info,
         )
         record(doc, "walk", "discovered",
