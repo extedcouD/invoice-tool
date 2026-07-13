@@ -1,57 +1,100 @@
-# Google Drive setup (one-time)
+# Google Drive setup
 
 The desktop app can read an invoice tree straight from Google Drive and publish
-results back to a new Drive folder. To let it sign in to your account you create
-a small Google Cloud OAuth client **once** and drop its `client_secret.json`
-where the app looks for it. No servers, no billing — a few clicks.
+results back to a new Drive folder.
 
-## 1. Create the OAuth client
+**If you are just using the app: there is no setup.** Open it → **Source: ☁️
+Google Drive → Connect Google Drive**, sign in with your work account, paste the
+Drive **folder link or id** of the invoice tree, name the **output folder**, and
+**Run**. Results (master workbook + a folder of the detected invoices) are written
+to a _new_ Drive folder — your originals are never modified.
 
-1. Go to <https://console.cloud.google.com/> and create a project (any name).
-2. **APIs & Services → Library →** search **Google Drive API →** *Enable*.
-3. **APIs & Services → OAuth consent screen:**
-   - User type **External**, fill in the app name + your email, **Save**.
-   - Leave **Publishing status = Testing**.
-   - **Test users → Add users →** add every Google account that will run the app
-     (yourself + colleagues). Only these accounts can sign in.
-4. **APIs & Services → Credentials → Create credentials → OAuth client ID:**
-   - Application type **Desktop app** → *Create*.
-   - **Download JSON** — this is your `client_secret.json`.
+The rest of this page is for whoever builds and releases the app.
 
-## 2. Install the secret
+## Why it needs no per-user setup
 
-Put the downloaded file (named exactly `client_secret.json`) in the app-support
-folder:
+The OAuth client is configured with user type **Internal**, meaning only accounts
+in our Google Workspace org can consent to it. Google waives app verification
+entirely for internal apps, which buys three things that the old External +
+Testing setup didn't have:
 
-| OS      | Folder |
-|---------|--------|
+- the _restricted_ `drive.readonly` scope works with **no security assessment**
+  (external apps would need the annual third-party CASA audit to publish it),
+- **no test-user list** — every account in the org can sign in, no allowlisting,
+- **no 7-day sign-in expiry.** External apps stuck in Testing mode get refresh
+  tokens that die after a week; internal apps don't, so long scans and repeat runs
+  don't hit surprise re-consent.
+
+Because it's one org-wide client, `client_secret.json` is **bundled inside the
+app** and users never handle it.
+
+## Maintainer: the Cloud project (one-time)
+
+The Cloud project must be **owned by the Workspace organisation** — a project
+created under a personal `@gmail.com` account will not offer the _Internal_ user
+type at all.
+
+1. [https://console.cloud.google.com/](https://console.cloud.google.com/) → create the project **inside the org**
+   (check the Organization field in the project picker; it must not say "No
+   organization").
+2. **APIs & Services → Library →** search **Google Drive API →** _Enable_.
+3. **Google Auth Platform → Audience:** set **User type = Internal**.
+4. **Google Auth Platform → Clients → Create client:** application type
+   **Desktop app** → _Create_ → **Download JSON**.
+
+## Maintainer: shipping the secret
+
+The secret is **not in git**. Google's secret scanner reports leaked OAuth clients
+on GitHub and auto-revokes them, which would break every installed copy of the app.
+It's injected at build time instead:
+
+```bash
+# local release build
+cp ~/Downloads/client_secret_*.json packaging/client_secret.json   # gitignored
+pyinstaller packaging/InvoiceGSTRLinker.spec --noconfirm
+
+# or point at it explicitly (this is what CI does, from a repo secret)
+INVOICES_CLIENT_SECRET_FILE=/path/to/client_secret.json \
+  pyinstaller packaging/InvoiceGSTRLinker.spec --noconfirm
+```
+
+The spec prints whether it bundled a client. Verify the built app before shipping —
+this fails the build if the secret didn't make it in:
+
+```bash
+dist/InvoiceGSTRLinker/InvoiceGSTRLinker --selftest
+# selftest OK: drive backend imports + discovery doc load + bundled OAuth client
+```
+
+A desktop OAuth client secret is not a true secret — Google's native-app guidance
+assumes it can be extracted from any distributed binary — so bundling it is the
+intended pattern, not a compromise. Internal user type means an extracted client
+still only lets org accounts sign in.
+
+## Overriding the bundled client
+
+`resolve_client_secret()` (`invoices/io/drive.py`) resolves in the order
+**explicit path → app-support dir → bundled**, so dropping your own
+`client_secret.json` in the app-support folder points the app at a different Cloud
+project without a rebuild — useful for development, or for a second org.
+
+| OS      | Folder                                             |
+| ------- | -------------------------------------------------- |
 | macOS   | `~/Library/Application Support/InvoiceGSTRLinker/` |
-| Windows | `%APPDATA%\InvoiceGSTRLinker\` |
-| Linux   | `~/.config/InvoiceGSTRLinker/` |
+| Windows | `%APPDATA%\InvoiceGSTRLinker\`                     |
+| Linux   | `~/.config/InvoiceGSTRLinker/`                     |
 
-(The folder is created the first time you open the app; you can also make it by
-hand.)
-
-## 3. Use it
-
-Open the app → **Source: ☁️ Google Drive → Connect Google Drive**. Your browser
-opens once to grant access; the token is cached afterwards. Then paste the Drive
-**folder link or id** of your invoice tree, give the **output folder** a name,
-and **Run**. Results (master workbook + a folder of the detected invoices) are
-written to a *new* Drive folder — your originals are never modified.
+The cached sign-in (`token.json`) lives there too; delete it to force re-consent.
 
 ## Good to know
 
-- **Scopes.** The app requests `drive.readonly` (to read your tree) and
-  `drive.file` (to create its own output folder). It cannot see or touch files it
-  didn't create, other than reading the folder you point it at.
-- **Weekly re-consent.** While the OAuth client is in **Testing** mode, Google
-  expires the sign-in about every 7 days, so you'll click "Connect" again
-  occasionally. That's expected for an internal tool and avoids Google's app
-  verification review. (Publishing the client to *Production* for wider use would
-  require that review because `drive.readonly` is a restricted scope.)
+- **Scopes.** `drive.readonly` to read the tree you point it at, `drive.file` to
+  create its own output folder. Note that `drive.file` alone could not do the scan:
+  it grants access only per-file, and picking a folder does **not** grant access to
+  the files inside it — which is why the read path needs `drive.readonly` and hence
+  why the client must be Internal.
 - **Interrupted runs resume.** A large scan checkpoints continuously; if the app
-  closes or the network drops, just start the same folder again and it picks up
-  where it left off.
+  closes or the network drops, start the same folder again and it picks up where it
+  left off.
 - **Only in-scope files download.** The app reads only PDFs under
   `.../Payments/Kotak/...`, so out-of-scope parts of the Drive never transfer.

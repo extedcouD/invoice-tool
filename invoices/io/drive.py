@@ -15,20 +15,27 @@ content transfer.
 
 Auth is the OAuth 2.0 *installed-app* loopback flow. On first use it opens the
 system browser for consent and caches the token; afterwards it refreshes
-silently. For an internal (Testing-mode) OAuth client the restricted
-``drive.readonly`` scope works without Google verification, but refresh tokens
-expire after ~7 days, so users re-consent about weekly. Output upload uses the
-non-sensitive ``drive.file`` scope (app-created files only).
+silently.
 
-Prerequisite: a Google Cloud project with the Drive API enabled and a "Desktop
-app" OAuth client; drop its ``client_secret.json`` in the app-support dir
-(see :func:`app_support_dir`).
+The OAuth client is configured with user type **Internal** (one Google Workspace
+org). Google waives verification for internal apps, so the *restricted*
+``drive.readonly`` scope works with no security assessment, no consent warning,
+no test-user list, and — unlike Testing mode — no 7-day refresh-token expiry.
+Output upload uses the non-sensitive ``drive.file`` scope.
+
+Because it is one org-wide client, the ``client_secret.json`` ships **inside the
+bundle** (see :func:`resolve_client_secret`) — end users sign in and nothing else.
+A desktop OAuth client secret is not a true secret (Google's native-app guidance
+assumes it can be extracted), and Internal means only org accounts can consent
+with it anyway. It is still kept out of git and injected at build time, so
+GitHub's secret scanner can't get it auto-revoked.
 """
 from __future__ import annotations
 
 import io
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Iterator, Optional
@@ -48,6 +55,7 @@ SCOPES = [
 FOLDER_MIME = "application/vnd.google-apps.folder"
 PDF_MIME = "application/pdf"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+SHEET_MIME = "application/vnd.google-apps.spreadsheet"   # native Sheet: export, don't download
 
 
 def folder_id_from(value: str) -> str:
@@ -67,6 +75,26 @@ def folder_id_from(value: str) -> str:
         return m.group(1)
     return value
 
+
+def file_id_from(value: str) -> str:
+    """Accept a raw file id or any Drive/Sheets *file* URL and return the id.
+
+    Covers the two links a user can realistically copy for a GSTR-2A workbook:
+    an uploaded .xlsx (``/file/d/<id>/view``) and a native Google Sheet
+    (``/spreadsheets/d/<id>/edit``), plus ``?id=`` and bare ids.
+    """
+    import re
+
+    value = (value or "").strip()
+    for pat in (r"/file/d/([A-Za-z0-9_\-]+)",
+                r"/spreadsheets/d/([A-Za-z0-9_\-]+)",
+                r"/document/d/([A-Za-z0-9_\-]+)",
+                r"[?&]id=([A-Za-z0-9_\-]+)"):
+        m = re.search(pat, value)
+        if m:
+            return m.group(1)
+    return value
+
 # Transient Drive errors we retry with exponential backoff.
 _RETRY_STATUS = {403, 429, 500, 502, 503, 504}
 
@@ -84,15 +112,68 @@ def app_support_dir() -> Path:
     return d
 
 
+def bundled_client_secret() -> Optional[Path]:
+    """The org's OAuth client shipped with the app, if this is a frozen build.
+
+    PyInstaller unpacks ``datas`` under ``sys._MEIPASS``; the spec places the
+    secret at the top of that tree. Source checkouts have no bundled secret and
+    fall back to the app-support dir.
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    if not base:
+        return None
+    p = Path(base) / "client_secret.json"
+    return p if p.exists() else None
+
+
+def resolve_client_secret(explicit: Optional[Path] = None) -> Optional[Path]:
+    """Locate the OAuth client secret: explicit > user override > bundled.
+
+    The app-support copy wins over the bundled one so a developer (or a second
+    org) can point the app at a different Cloud project without a rebuild.
+    """
+    if explicit:
+        return Path(explicit)
+    override = app_support_dir() / "client_secret.json"
+    if override.exists():
+        return override
+    return bundled_client_secret()
+
+
 class DriveAuthError(RuntimeError):
     """Raised when Drive credentials are missing or consent fails."""
 
 
 class DriveClient:
-    """Thin wrapper over the Drive v3 API with retry/backoff."""
+    """Thin wrapper over the Drive v3 API with retry/backoff.
 
-    def __init__(self, service) -> None:
-        self._svc = service
+    **Thread-safety.** ``google-api-python-client`` is built on ``httplib2``, which
+    is *not* thread-safe: sharing one service object across the scan's worker
+    threads means several threads driving one TLS connection, which corrupts
+    OpenSSL's heap and hard-crashes the process (SIGTRAP, "memory corruption of
+    free block" — no Python traceback, because the damage is in C).
+
+    So the service is **thread-local**: each worker builds its own on first use and
+    reuses it thereafter — one connection per thread, not one per request. The
+    credentials object is shared, which is fine: a concurrent double-refresh just
+    mints two valid access tokens.
+    """
+
+    def __init__(self, creds) -> None:
+        self._creds = creds
+        self._tl = threading.local()
+
+    @property
+    def _svc(self):
+        svc = getattr(self._tl, "svc", None)
+        if svc is None:
+            from googleapiclient.discovery import build
+            # static_discovery=True uses the discovery doc bundled with the
+            # library, so building per-thread costs no network round-trip.
+            svc = build("drive", "v3", credentials=self._creds,
+                        cache_discovery=False, static_discovery=True)
+            self._tl.svc = svc
+        return svc
 
     # ---- auth --------------------------------------------------------------
     @classmethod
@@ -104,15 +185,13 @@ class DriveClient:
             from google.auth.transport.requests import Request
             from google.oauth2.credentials import Credentials
             from google_auth_oauthlib.flow import InstalledAppFlow
-            from googleapiclient.discovery import build
         except ImportError as exc:  # pragma: no cover - packaging guard
             raise DriveAuthError(
                 "Google API libraries are not installed "
                 "(google-api-python-client, google-auth-oauthlib)."
             ) from exc
 
-        secret = Path(client_secret_path) if client_secret_path else \
-            app_support_dir() / "client_secret.json"
+        secret = resolve_client_secret(client_secret_path)
         token = Path(token_path) if token_path else app_support_dir() / "token.json"
 
         creds = None
@@ -124,23 +203,29 @@ class DriveClient:
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                if not secret.exists():
+                try:
+                    creds.refresh(Request())
+                except Exception:
+                    # A cached token is tied to the OAuth client that minted it, so
+                    # it dies when the client changes (e.g. the old External/Testing
+                    # client -> the org's Internal one) as well as on revoke/expiry.
+                    # Re-consent instead of dead-ending the user on an OAuth error.
+                    creds = None
+            if not creds or not creds.valid:
+                if secret is None or not secret.exists():
                     raise DriveAuthError(
-                        f"Google OAuth client secret not found at {secret}. Create a "
-                        "'Desktop app' OAuth client in Google Cloud (Drive API enabled) "
-                        "and save its client_secret.json there. See docs/DRIVE_SETUP.md."
+                        "This build has no Google OAuth client bundled, so it can't "
+                        "connect to Drive. A release build ships the organisation's "
+                        f"client; to use your own, save a 'Desktop app' client_secret.json "
+                        f"at {app_support_dir() / 'client_secret.json'} "
+                        "(Drive API enabled). See docs/DRIVE_SETUP.md."
                     )
                 flow = InstalledAppFlow.from_client_secrets_file(str(secret), SCOPES)
                 creds = flow.run_local_server(port=0, open_browser=open_browser)
             token.write_text(creds.to_json())
 
-        # static_discovery=True uses the discovery doc bundled with the library
-        # (no extra network fetch — important inside the packaged app).
-        service = build("drive", "v3", credentials=creds,
-                        cache_discovery=False, static_discovery=True)
-        return cls(service)
+        # Services are built lazily per thread (see _svc) — not here.
+        return cls(creds)
 
     # ---- low-level with retry ---------------------------------------------
     def _execute(self, request):
@@ -198,19 +283,61 @@ class DriveClient:
                     yield parts, child
 
     # ---- download / upload -------------------------------------------------
-    def download_to_temp(self, file_id: str) -> str:
-        """Download a file to a temp .pdf and return its local path."""
+    def get_meta(self, file_id: str) -> dict:
+        return self._execute(self._svc.files().get(
+            fileId=file_id, fields="id,name,mimeType,size",
+            supportsAllDrives=True))
+
+    def download_to_temp(self, file_id: str, suffix: str = ".pdf") -> str:
+        """Download a binary file to a temp file and return its local path."""
         import tempfile
 
         from googleapiclient.http import MediaIoBaseDownload
 
-        fd, tmp = tempfile.mkstemp(suffix=".pdf", prefix="invdrive_")
+        fd, tmp = tempfile.mkstemp(suffix=suffix, prefix="invdrive_")
         os.close(fd)
         try:
             with open(tmp, "wb") as fh:
                 downloader = MediaIoBaseDownload(
                     fh, self._svc.files().get_media(
                         fileId=file_id, supportsAllDrives=True))
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+            return tmp
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+    def download_workbook_to_temp(self, file_id: str) -> str:
+        """Fetch a GSTR-2A workbook as a local .xlsx, whatever it is on Drive.
+
+        A native Google Sheet has no bytes to download — ``get_media`` fails on it
+        — so it has to be *exported* to xlsx instead. Users paste whichever link
+        they have, so handle both rather than making them convert by hand.
+        """
+        import tempfile
+
+        from googleapiclient.http import MediaIoBaseDownload
+
+        meta = self.get_meta(file_id)
+        mime = meta.get("mimeType", "")
+        if mime == FOLDER_MIME:
+            raise ValueError(
+                f"{meta.get('name', file_id)!r} is a folder, not a GSTR-2A workbook.")
+
+        if mime != SHEET_MIME:
+            return self.download_to_temp(file_id, suffix=".xlsx")
+
+        fd, tmp = tempfile.mkstemp(suffix=".xlsx", prefix="invgstr_")
+        os.close(fd)
+        try:
+            with open(tmp, "wb") as fh:
+                downloader = MediaIoBaseDownload(fh, self._svc.files().export_media(
+                    fileId=file_id, mimeType=XLSX_MIME))
                 done = False
                 while not done:
                     _, done = downloader.next_chunk()

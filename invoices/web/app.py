@@ -86,6 +86,22 @@ def create_app(controller: RunController) -> Flask:
                                upload_folder_name=upload_folder)
         return jsonify(res), (200 if res.get("ok") else 400)
 
+    @app.route("/api/pause", methods=["POST"])
+    def api_pause():
+        res = controller.pause()
+        return jsonify(res), (200 if res.get("ok") else 400)
+
+    @app.route("/api/resume", methods=["POST"])
+    def api_resume():
+        res = controller.resume_run()
+        return jsonify(res), (200 if res.get("ok") else 400)
+
+    @app.route("/api/stop", methods=["POST"])
+    def api_stop():
+        """Stop the scan. Safe: the run stays resumable from its checkpoint."""
+        res = controller.stop()
+        return jsonify(res), (200 if res.get("ok") else 400)
+
     @app.route("/api/drive/auth", methods=["POST"])
     def api_drive_auth():
         """Sign in to Google Drive (opens the system browser for consent)."""

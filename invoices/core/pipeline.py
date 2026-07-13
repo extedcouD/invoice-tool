@@ -16,16 +16,19 @@ from typing import Callable, Optional, Sequence
 
 from ..observability.events import CLOCK, record
 from ..observability.progress import Reporter
+from ..core.control import RunCancelled, RunControl
 from ..core.interfaces import Stage
 from ..core.models import Document, Severity, StageMetric
 
 
 class Pipeline:
     def __init__(self, stages: Sequence[Stage], reporter: Reporter | None = None,
-                 workers: int = 1) -> None:
+                 workers: int = 1, control: RunControl | None = None) -> None:
         self.stages = list(stages)
         self.reporter = reporter or Reporter()
         self.workers = max(1, workers)
+        self.control = control
+        self.cancelled = False   # set if the user stopped the run mid-flight
         self._timings: dict[str, float] = {s.name: 0.0 for s in self.stages}
         self._counts_by_stage: dict[str, int] = {s.name: 0 for s in self.stages}
         self._errors_by_stage: dict[str, int] = {s.name: 0 for s in self.stages}
@@ -33,6 +36,11 @@ class Pipeline:
 
     # ---- single document ---------------------------------------------------
     def run_one(self, doc: Document) -> Document:
+        # Check in *before* touching the doc, and outside the per-stage
+        # try/except below — which would otherwise swallow RunCancelled and
+        # mistake a user's Stop for a stage failure.
+        if self.control is not None:
+            self.control.gate()
         for stage in self.stages:
             t0 = time.monotonic()
             err = False
@@ -93,10 +101,16 @@ class Pipeline:
             if on_doc_done is not None:
                 on_doc_done(doc)
 
+        # A cancelled doc is never tallied and never handed to on_doc_done, so it
+        # stays out of the checkpoint and a later resume picks it up again.
         results: list[Document] = list(docs)
         if self.workers == 1:
             for i, doc in enumerate(docs):
-                results[i] = self.run_one(doc)
+                try:
+                    results[i] = self.run_one(doc)
+                except RunCancelled:
+                    self.cancelled = True
+                    break
                 tally(results[i], i + 1)
         else:
             # OCR shells out to the tesseract binary, so threads give real
@@ -106,7 +120,13 @@ class Pipeline:
                 done = 0
                 for fut in as_completed(fut_to_i):
                     i = fut_to_i[fut]
-                    results[i] = fut.result()
+                    try:
+                        results[i] = fut.result()
+                    except RunCancelled:
+                        # Already-submitted futures still run, but each one now
+                        # trips the gate immediately, so they unwind fast.
+                        self.cancelled = True
+                        continue
                     done += 1
                     tally(results[i], done)
 

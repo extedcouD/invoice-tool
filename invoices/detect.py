@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .config import Settings, DEFAULTS
+from .core.control import RunControl
 from .core.interfaces import FileSource
 from .core.models import Document, DocType, RunResult
 from .core.pipeline import Pipeline
@@ -35,7 +36,8 @@ Walker = Callable[[object, Settings], list[Document]]
 
 
 def build_pipeline(settings: Settings, reporter: Reporter,
-                   file_source: FileSource | None = None) -> Pipeline:
+                   file_source: FileSource | None = None,
+                   control: RunControl | None = None) -> Pipeline:
     return Pipeline(
         stages=[
             ExtractStage(PdfTextSource(settings, file_source)),
@@ -46,6 +48,7 @@ def build_pipeline(settings: Settings, reporter: Reporter,
         ],
         reporter=reporter,
         workers=settings.workers,
+        control=control,
     )
 
 
@@ -116,12 +119,18 @@ def run_scan(root, out_root: Path, settings: Settings = DEFAULTS,
              quiet: bool = False, store: RunStore | None = None,
              file_source: FileSource | None = None,
              walker: Optional[Walker] = None,
-             root_key: str | None = None) -> tuple[RunStore, RunResult]:
+             root_key: str | None = None,
+             control: "RunControl | None" = None) -> tuple[RunStore, RunResult]:
     """Scan a tree (local path or, via ``walker``/``file_source``, a Drive folder).
 
     Resumable: if ``store`` already holds a checkpoint (an interrupted run reopened
     by the caller), every source already recorded is skipped and only the
     remainder is processed; the final result is assembled from the full ledger.
+
+    ``control`` (optional) lets the caller pause/stop the scan. A stopped run still
+    writes its partial detections + master from the docs that *did* finish, but is
+    deliberately left marked **incomplete** so the next run over the same input
+    resumes it instead of starting over.
     """
     file_source = file_source or LocalFileSource()
     walker = walker or walk
@@ -134,7 +143,7 @@ def run_scan(root, out_root: Path, settings: Settings = DEFAULTS,
     store.write_meta(root=root_key, complete=False)
 
     reporter = MultiReporter(
-        StatusWriter(store.status_path),
+        StatusWriter(store.status_path, control=control),
         None if quiet else RichReporter(),
     )
 
@@ -143,7 +152,7 @@ def run_scan(root, out_root: Path, settings: Settings = DEFAULTS,
     done_keys = store.done_keys()                      # empty for a fresh run
     todo = [d for d in all_docs if d.source_key not in done_keys]
 
-    pipeline = build_pipeline(settings, reporter, file_source)
+    pipeline = build_pipeline(settings, reporter, file_source, control=control)
     pipeline.run(todo, on_doc_done=store.append_checkpoint,
                  start_done=len(all_docs) - len(todo), total=len(all_docs))
 
@@ -165,6 +174,7 @@ def run_scan(root, out_root: Path, settings: Settings = DEFAULTS,
 
     store.save(result)
     write_master(result, store.master_path())
-    store.write_meta(root=root_key, complete=True)     # mark done (no longer resumable)
+    # A stopped run stays resumable; only a run that reached the end is complete.
+    store.write_meta(root=root_key, complete=not pipeline.cancelled)
     reporter.finish(result.summary())
     return store, result

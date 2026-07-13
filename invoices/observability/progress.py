@@ -11,6 +11,7 @@ The pipeline only depends on the `Reporter` interface, so adding a new sink
 from __future__ import annotations
 
 import json
+import time
 from collections import deque
 from pathlib import Path
 from typing import Optional
@@ -59,14 +60,51 @@ class MultiReporter(Reporter):
 
 
 class StatusWriter(Reporter):
-    """Persists a small status.json snapshot for out-of-process observers."""
+    """Persists a small status.json snapshot for out-of-process observers.
 
-    def __init__(self, path: Path) -> None:
+    Also derives the ETA. Two things make that less trivial than ``total-done``:
+
+    * A **resumed** run starts with ``done`` already at the checkpoint count, so
+      throughput must be measured from work completed *this session* — otherwise
+      the first document appears to have taken the whole elapsed time.
+    * **Paused** time is excluded (via ``control``), so stepping away for lunch
+      doesn't permanently poison the estimate.
+
+    The rate is a session average rather than an instantaneous one: over a scan
+    long enough for an ETA to matter, it's far steadier, and it doesn't lurch
+    every time a scanned PDF drops into OCR.
+    """
+
+    def __init__(self, path: Path, control: object | None = None) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._total = 0
+        self._control = control          # RunControl, for paused-time + paused flag
+        self._t0 = time.monotonic()
+        self._done0: Optional[int] = None  # `done` before this session's first doc
         # newest-first tail of finished docs, for the live activity feed
         self._recent: deque[dict] = deque(maxlen=40)
+
+    def _elapsed(self) -> float:
+        """Wall-clock this session, minus any time spent paused."""
+        paused = 0.0
+        if self._control is not None:
+            paused = self._control.paused_seconds()
+        return max(0.0, (time.monotonic() - self._t0) - paused)
+
+    def _eta(self, done: int, total: int) -> tuple[Optional[float], Optional[float]]:
+        """(seconds remaining, docs per second) — both None until measurable."""
+        if self._done0 is None or total <= 0:
+            return None, None
+        processed = done - self._done0
+        elapsed = self._elapsed()
+        if processed <= 0 or elapsed <= 0:
+            return None, None
+        rate = processed / elapsed
+        return (max(0, total - done) / rate if rate > 0 else None), rate
+
+    def _paused(self) -> bool:
+        return bool(self._control is not None and getattr(self._control, "paused", False))
 
     def _write(self, payload: dict) -> None:
         tmp = self.path.with_suffix(".tmp")
@@ -75,24 +113,38 @@ class StatusWriter(Reporter):
 
     def start(self, total: int) -> None:
         self._total = total
+        self._t0 = time.monotonic()
+        self._done0 = None
         self._write({"state": "running", "done": 0, "total": total,
                      "stage": "starting", "counts": {}, "pct": 0.0,
-                     "current": None, "recent": []})
+                     "current": None, "recent": [], "paused": False,
+                     "elapsed_s": 0.0, "eta_s": None, "rate": None})
 
     def update(self, done: int, total: int, stage: str, counts: dict,
                note: Optional[dict] = None) -> None:
+        if self._done0 is None:
+            # First completion of this session: everything already counted in
+            # `done` came from the checkpoint, not from time we spent.
+            self._done0 = done - 1
         if note:
             self._recent.appendleft(note)
+        eta, rate = self._eta(done, total)
         self._write({"state": "running", "done": done, "total": total,
                      "stage": stage, "counts": counts,
                      "pct": round(100 * done / total, 1) if total else 0.0,
                      "current": (note or {}).get("file"),
-                     "recent": list(self._recent)})
+                     "recent": list(self._recent),
+                     "paused": self._paused(),
+                     "elapsed_s": round(self._elapsed(), 1),
+                     "eta_s": round(eta) if eta is not None else None,
+                     "rate": round(rate, 2) if rate is not None else None})
 
     def finish(self, summary: dict) -> None:
         self._write({"state": "done", "done": self._total, "total": self._total,
                      "stage": "finished", "summary": summary, "pct": 100.0,
-                     "current": None, "recent": list(self._recent)})
+                     "current": None, "recent": list(self._recent),
+                     "paused": False, "elapsed_s": round(self._elapsed(), 1),
+                     "eta_s": 0, "rate": None})
 
 
 class RichReporter(Reporter):

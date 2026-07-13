@@ -42,7 +42,10 @@
         <label>1 · Invoice folder on Drive <span class="muted">(paste the folder link or id)</span></label>
         <input id="drive-folder" placeholder="https://drive.google.com/drive/folders/…  or  <folderId>" autocomplete="off">
         <div style="height:14px"></div>
-        <label>2 · Output folder name <span class="muted">(a new folder created in your Drive)</span></label>
+        <label>2 · GSTR-2A workbook on Drive <span class="muted">(optional — paste the file link; an .xlsx or a Google Sheet both work)</span></label>
+        <input id="drive-gstr" placeholder="https://drive.google.com/file/d/…/view  or  <fileId>" autocomplete="off">
+        <div style="height:14px"></div>
+        <label>3 · Output folder name <span class="muted">(a new folder created in your Drive)</span></label>
         <input id="drive-out" placeholder="InvoiceLinker results" autocomplete="off">
       </div>
     </div>
@@ -60,11 +63,28 @@
   <div class="bar" style="height:10px"><span id="bar" style="width:0%"></span></div>
   <div class="flex" style="justify-content:space-between;margin-top:6px">
     <span class="muted mono" id="progress-text">0 / 0</span>
+    <span class="muted mono" id="eta-text"></span>
     <span class="muted mono" id="pct-text">0%</span>
+  </div>
+  <div class="flex" style="gap:10px;margin-top:14px">
+    <button class="btn ghost" id="pause" type="button">⏸ Pause</button>
+    <button class="btn ghost" id="stop" type="button">⏹ Stop</button>
+    <span class="muted" id="stop-hint">Stopping is safe — progress is checkpointed, and running the same folder again resumes it.</span>
   </div>
   <div id="chips" class="grid cards" style="margin:16px 0"></div>
   <h2>Live activity <span class="muted">— what the pipeline is doing, newest first</span></h2>
   <div class="feed" id="feed"><div class="row"><span class="muted">waiting for the first document…</span></div></div>
+</div>
+
+<!-- 2b · STOPPED ----------------------------------------------------------- -->
+<div id="stopped" style="display:none">
+  <h1>⏸ Scan stopped</h1>
+  <div id="stopped-sub" class="muted" style="margin-bottom:16px"></div>
+  <div id="stopped-cards" class="grid cards" style="margin-bottom:16px"></div>
+  <div class="flex" style="gap:12px;flex-wrap:wrap">
+    <button class="btn big" id="resume-run" type="button">▶ Resume where it left off</button>
+    <a class="btn big ghost" href="/review">Review what's done so far →</a>
+  </div>
 </div>
 
 <!-- 3 · DONE -------------------------------------------------------------- -->
@@ -90,9 +110,19 @@ const hasNative = () => !!(window.pywebview && window.pywebview.api);
 const esc = s => { const d = document.createElement("div"); d.textContent = (s==null?"":s); return d.innerHTML; };
 
 function show(section){
-  for(const s of ["setup","live","done"]) $(s).style.display = (s===section) ? "block" : "none";
+  for(const s of ["setup","live","stopped","done"]) $(s).style.display = (s===section) ? "block" : "none";
 }
 function showErr(m){ $("err").textContent = m; $("err").style.display = "block"; }
+
+// Round hard: nobody wants "about 43 minutes and 12 seconds remaining".
+function fmtEta(sec){
+  if(sec == null || !isFinite(sec)) return "";
+  if(sec < 60) return "about " + Math.max(1, Math.round(sec)) + "s left";
+  const m = Math.round(sec / 60);
+  if(m < 60) return "about " + m + " min left";
+  const h = Math.floor(m / 60), r = m % 60;
+  return "about " + h + "h " + (r ? r + "m " : "") + "left";
+}
 
 // ---- source mode (local vs Google Drive) ---------------------------------
 let sourceMode = "local";
@@ -137,7 +167,8 @@ $("run").onclick = async () => {
     if(!driveConnected){ showErr("Connect Google Drive first."); return; }
     const folder = $("drive-folder").value.trim();
     if(!folder){ showErr("Paste the Google Drive folder link or id."); return; }
-    payload = {source_mode:"drive", invoice: folder, upload_folder: $("drive-out").value.trim()};
+    payload = {source_mode:"drive", invoice: folder, gstr: $("drive-gstr").value.trim(),
+               upload_folder: $("drive-out").value.trim()};
   } else {
     const invoice = $("inv").value.trim();
     if(!invoice){ showErr("Choose the invoice folder first."); return; }
@@ -149,11 +180,47 @@ $("run").onclick = async () => {
       body: JSON.stringify(payload)});
     const j = await r.json();
     if(!j.ok){ showErr(j.error || "Could not start the run."); $("run").disabled = false; return; }
+    lastPayload = payload;          // so Stop → Resume can re-issue the same run
     if(j.resumed) $("phase-label").textContent = "Resuming previous scan…";
+    resetLiveControls();
     show("live"); poll();
   }catch(e){ showErr(String(e)); $("run").disabled = false; }
 };
+let lastPayload = null;
 $("again").onclick = () => { show("setup"); $("run").disabled = false; };
+
+// ---- pause / stop --------------------------------------------------------
+let paused = false;
+$("pause").onclick = async () => {
+  const r = await fetch(paused ? "/api/resume" : "/api/pause", {method:"POST"});
+  const j = await r.json();
+  if(j.ok) paused = !!j.paused;   // the button relabels on the next poll tick
+};
+$("stop").onclick = async () => {
+  $("stop").disabled = true;
+  $("stop").textContent = "Stopping…";
+  $("stop-hint").textContent = "Letting the documents already in flight finish…";
+  await fetch("/api/stop", {method:"POST"});
+};
+// Resuming is just starting the same input again — RunStore.find_resumable
+// reopens the interrupted run and the scan skips whatever is already checkpointed.
+$("resume-run").onclick = async () => {
+  if(!lastPayload) { show("setup"); return; }
+  $("resume-run").disabled = true;
+  const r = await fetch("/api/start", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify(lastPayload)});
+  const j = await r.json();
+  $("resume-run").disabled = false;
+  if(!j.ok){ show("setup"); showErr(j.error || "Could not resume."); return; }
+  resetLiveControls();
+  show("live"); poll();
+};
+function resetLiveControls(){
+  paused = false;
+  $("pause").disabled = false; $("pause").textContent = "⏸ Pause";
+  $("stop").disabled = false;  $("stop").textContent = "⏹ Stop";
+  $("stop-hint").textContent = "Stopping is safe — progress is checkpointed, and running the same folder again resumes it.";
+}
 
 // ---- live rendering ------------------------------------------------------
 const dotClass = n => n.error ? "bad" : (n.type === "invoice" ? (n.flags ? "warn" : "ok") : "info");
@@ -186,16 +253,38 @@ async function poll(){
     $("bar").style.width = (s.pct||0) + "%";
     $("progress-text").textContent = (s.done||0) + " / " + (s.total||0);
     $("pct-text").textContent = (s.pct||0) + "%";
-    if(s.current) $("live-sub").textContent = "processing " + s.current;
+
+    paused = !!s.paused;
+    $("pause").textContent = paused ? "▶ Resume" : "⏸ Pause";
+    // While paused the ETA is meaningless (and the clock is stopped anyway).
+    $("eta-text").textContent = paused ? "paused" : fmtEta(s.eta_s);
+
+    if(s.current) $("live-sub").textContent = paused ? "paused — nothing in flight"
+                                                     : "processing " + s.current;
     renderChips(s.counts);
     renderFeed(s.recent);
-    if(rs.phase === "linking") $("phase-label").textContent = "Linking to GSTR-2A…";
+    if(paused) $("phase-label").textContent = "Paused";
+    else if(rs.phase === "linking") $("phase-label").textContent = "Linking to GSTR-2A…";
     else if(rs.phase === "scanning") $("phase-label").textContent = "Scanning invoices…";
+    if(rs.phase === "stopped"){ finishStopped(rs, s); polling = false; return; }
     if(rs.phase === "done"){ finishDone(rs); polling = false; return; }
     if(rs.phase === "error"){ show("setup"); showErr(rs.error || "Run failed."); $("run").disabled = false; polling = false; return; }
   }catch(e){ /* transient — keep polling */ }
   polling = false;
   setTimeout(poll, 500);
+}
+
+function finishStopped(rs, s){
+  const sm = rs.summary || {};
+  const done = (s && s.done) || 0, total = (s && s.total) || 0;
+  $("stopped-sub").textContent =
+    `Stopped after ${done} of ${total} PDFs. Everything scanned so far is saved — `
+    + `resume to carry on from here, or review what's done.`;
+  $("stopped-cards").innerHTML = [
+    ["Scanned", done], ["Remaining", Math.max(0, total - done)],
+    ["Invoices", sm.invoices], ["Flagged", sm.flagged],
+  ].map(([k,v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v==null?"–":v}</div></div>`).join("");
+  show("stopped");
 }
 
 function finishDone(rs){

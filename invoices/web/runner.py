@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..config import DEFAULTS, Settings
+from ..core.control import RunControl
 from ..core.models import RunResult
 from ..detect import run_scan
 from ..io.gstr import link_gstr
@@ -40,11 +41,12 @@ class RunController:
         self._lock = threading.Lock()
         self.store: Optional[RunStore] = None
         self.result: Optional[RunResult] = None
-        self.phase: str = "idle"          # idle|scanning|linking|done|error
+        self.phase: str = "idle"          # idle|scanning|linking|done|stopped|error
         self.error: Optional[str] = None
         self.link_report = None
         self.gstr_path: Optional[Path] = None   # remembered for post-review linking
         self._thread: Optional[threading.Thread] = None
+        self.control: Optional[RunControl] = None   # pause/stop for the live scan
         # ---- Google Drive source/sink (Phase 3) ----
         self.source_mode: str = "local"    # local | drive
         self.drive = None                  # DriveClient once signed in
@@ -83,22 +85,34 @@ class RunController:
 
             self.source_mode = source_mode
             self.upload_folder_name = (upload_folder_name or "").strip() or None
-            gstr = Path(str(gstr_path)).expanduser() if gstr_path else None
-            if gstr is not None and not gstr.exists():
-                return {"ok": False, "error": f"GSTR-2A file not found: {gstr}"}
 
             if source_mode == "drive":
                 if self.drive is None:
                     return {"ok": False, "error": "Connect Google Drive first."}
-                from ..io.drive import DriveFileSource, folder_id_from, walk_drive
+                from ..io.drive import (DriveFileSource, file_id_from,
+                                        folder_id_from, walk_drive)
                 folder_id = folder_id_from(str(invoice_root))
                 if not folder_id:
                     return {"ok": False, "error": "Enter a Google Drive folder link or id."}
+                # The GSTR-2A workbook lives on Drive too. Fetch it now — it's small,
+                # and a bad link should fail here in the form rather than an hour
+                # later when the user clicks "Finish & export".
+                gstr: Optional[Path] = None
+                if gstr_path:
+                    try:
+                        gstr = Path(self.drive.download_workbook_to_temp(
+                            file_id_from(str(gstr_path))))
+                    except Exception as exc:
+                        return {"ok": False,
+                                "error": f"Could not read that GSTR-2A workbook from Drive: {exc}"}
                 root: Any = folder_id
                 root_key = f"drive:{folder_id}"
                 file_source: Any = DriveFileSource(self.drive)
                 walker: Any = partial(walk_drive, client=self.drive)
             else:
+                gstr = Path(str(gstr_path)).expanduser() if gstr_path else None
+                if gstr is not None and not gstr.exists():
+                    return {"ok": False, "error": f"GSTR-2A file not found: {gstr}"}
                 inv = Path(str(invoice_root)).expanduser()
                 if not inv.exists() or not inv.is_dir():
                     return {"ok": False, "error": f"Invoice folder not found: {inv}"}
@@ -117,21 +131,48 @@ class RunController:
             self.gstr_path = gstr           # linked later, after review (see link_now)
             self.error = None
             self.phase = "scanning"
+            self.control = RunControl()
             self._thread = threading.Thread(
                 target=self._run, args=(root, root_key, file_source, walker),
                 daemon=True)
             self._thread.start()
             return {"ok": True, "run_id": self.store.run_id, "resumed": self.resumed}
 
+    # ---- pause / stop ------------------------------------------------------
+    def pause(self) -> dict:
+        if self.control is None or not self.busy:
+            return {"ok": False, "error": "No run in progress."}
+        self.control.pause()
+        return {"ok": True, "paused": True}
+
+    def resume_run(self) -> dict:
+        if self.control is None or not self.busy:
+            return {"ok": False, "error": "No run in progress."}
+        self.control.resume()
+        return {"ok": True, "paused": False}
+
+    def stop(self) -> dict:
+        """Stop after the in-flight documents finish. The run stays resumable.
+
+        Everything already scanned is in the checkpoint and the partial master is
+        still written, so this is a safe exit, not a discard: start the same folder
+        again and it picks up where it left off.
+        """
+        if self.control is None or not self.busy:
+            return {"ok": False, "error": "No run in progress."}
+        self.control.stop()
+        return {"ok": True, "stopping": True}
+
     def _run(self, root, root_key, file_source, walker) -> None:
         try:
             store, result = run_scan(root, self.output_root, self.settings,
                                      quiet=True, store=self.store,
                                      file_source=file_source, walker=walker,
-                                     root_key=root_key)
+                                     root_key=root_key, control=self.control)
             with self._lock:
                 self.store, self.result = store, result
-                self.phase = "done"
+                self.phase = "stopped" if (
+                    self.control is not None and self.control.stopped) else "done"
             # GSTR linking is deliberately deferred: it now runs from the review
             # UI's "Finish & export" action (web/app.py::finish -> link_now) so the
             # linked workbook + flat invoice folder reflect human corrections.
@@ -163,6 +204,14 @@ class RunController:
             master = self.store.master_path()
             if master.exists():
                 self.drive.upload_file(master, folder_id, mime=XLSX_MIME)
+            # The linked GSTR-2A workbook is the point of the whole run, so it goes
+            # up alongside the master (when linking has actually been run).
+            linked = False
+            if self.link_report is not None:
+                out = Path(self.link_report.out_path)
+                if out.exists():
+                    self.drive.upload_file(out, folder_id, mime=XLSX_MIME)
+                    linked = True
             inv_folder = self.drive.create_folder("invoices", folder_id)
             copied = 0
             for d in self.result.invoices():
@@ -170,7 +219,7 @@ class RunController:
                     self.drive.copy_file(d.drive_file_id, inv_folder, name=d.filename)
                     copied += 1
             report = {"ok": True, "folder": name, "folder_id": folder_id,
-                      "invoices": copied}
+                      "invoices": copied, "linked_workbook": linked}
         except Exception as exc:
             report = {"ok": False, "error": str(exc)}
         with self._lock:

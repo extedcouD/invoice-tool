@@ -100,6 +100,19 @@ _drive_doc = _gac / "drive.v3.json"
 if _drive_doc.exists():
     datas.append((str(_drive_doc), "googleapiclient/discovery_cache/documents"))
 
+# The org's OAuth client (user type Internal). Bundling it is what lets an end
+# user just click "Connect Google Drive" instead of standing up their own Cloud
+# project. Kept OUT of git — GitHub's secret scanner reports leaked Google OAuth
+# clients and Google auto-revokes them — so CI writes it from a repo secret. A
+# build without it still works for everything except Drive, and says so.
+_secret = os.environ.get("INVOICES_CLIENT_SECRET_FILE") or str(ROOT / "packaging" / "client_secret.json")
+if Path(_secret).exists():
+    datas.append((_secret, "."))   # -> sys._MEIPASS/client_secret.json
+    print(f"[spec] bundling Google OAuth client: {_secret}")
+else:
+    print(f"[spec] WARNING: no client_secret.json at {_secret} — Drive sign-in will be "
+          "unavailable in this build (set INVOICES_CLIENT_SECRET_FILE to bundle one).")
+
 a = Analysis(
     [str(ROOT / "run_gui.py")],
     pathex=[str(ROOT)],

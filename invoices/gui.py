@@ -151,13 +151,23 @@ def _selftest() -> int:
     PyInstaller hidden-imports for the Google API libraries before a release,
     without needing credentials or a network. Run: InvoiceGSTRLinker --selftest
     """
-    from .io.drive import DriveClient, walk_drive, folder_id_from  # noqa: F401
+    from .io.drive import (DriveClient, walk_drive, folder_id_from,  # noqa: F401
+                           bundled_client_secret)
     from googleapiclient.discovery import build
     # static_discovery reads the bundled drive.v3.json (no network, no auth).
     build("drive", "v3", developerKey="selftest",
           static_discovery=True, cache_discovery=False)
     assert folder_id_from("https://drive.google.com/drive/folders/ABC123") == "ABC123"
-    print("selftest OK: drive backend imports + discovery doc load")
+
+    # A frozen build with no OAuth client can't sign in to Drive at all, and the
+    # failure would only show up in front of a user. Fail the release instead.
+    if getattr(sys, "frozen", False) and bundled_client_secret() is None:
+        print("selftest FAILED: no client_secret.json in the bundle — Drive sign-in "
+              "would be unavailable. Set INVOICES_CLIENT_SECRET_FILE and rebuild.")
+        return 1
+
+    print("selftest OK: drive backend imports + discovery doc load"
+          + (" + bundled OAuth client" if bundled_client_secret() else ""))
     return 0
 
 
