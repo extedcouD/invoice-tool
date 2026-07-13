@@ -58,8 +58,15 @@ INVOICES_CLIENT_SECRET_FILE=/path/to/client_secret.json \
   pyinstaller packaging/InvoiceGSTRLinker.spec --noconfirm
 ```
 
+For the GitHub Actions release build, paste the **whole JSON file contents** into a
+repo secret named **`GOOGLE_CLIENT_SECRET_JSON`** (Settings → Secrets and variables
+→ Actions → New repository secret). `build-desktop-apps.yml` writes it to
+`packaging/client_secret.json` before PyInstaller runs. Forks and pull requests
+don't get the secret, so they build a Drive-less app — that is intended.
+
 The spec prints whether it bundled a client. Verify the built app before shipping —
-this fails the build if the secret didn't make it in:
+this fails the build if the secret didn't make it in (CI runs it on every build, and
+makes it fatal on a `v*` tag):
 
 ```bash
 dist/InvoiceGSTRLinker/InvoiceGSTRLinker --selftest
