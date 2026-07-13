@@ -4,17 +4,37 @@
 `Document`s with a best-effort `PathInfo`. Parsing is positional but forgiving:
 each path component is *labelled* by regex rather than assumed at a fixed depth,
 so an extra/missing folder level doesn't derail the whole record.
+
+It is a **generator**, and it checks in with the :class:`RunControl` as it goes:
+the pipeline pulls documents from it lazily, so the first PDF is processed while
+the rest of the tree is still being enumerated, and Stop works *during* discovery
+(on a 120 GB Drive tree that phase alone runs for minutes).
 """
 from __future__ import annotations
 
+import hashlib
+import os
 from pathlib import Path
+from typing import Iterator, Optional
 
 from ..config import (
     RE_DATE, RE_FY, RE_MONTH, Settings, DEFAULTS,
     CANDIDATE_SUFFIXES, IGNORE_FILENAMES, IGNORE_SUFFIXES,
 )
+from ..core.control import RunControl
 from ..core.models import Document, PathInfo
 from ..observability.events import record
+
+
+def doc_id_for(source_key: str) -> str:
+    """A stable id derived from the source, not from walk position.
+
+    An index-based id (`d00007`) is only unique within one enumeration: on a
+    resumed run over a tree that has since gained or lost a file, a freshly
+    walked document can collide with a different, already-checkpointed one. A
+    content-free hash of the source key is stable across runs and can't collide.
+    """
+    return "d" + hashlib.sha1(source_key.encode("utf-8")).hexdigest()[:10]
 
 
 def _parse_path(rel_parts: list[str]) -> PathInfo:
@@ -56,47 +76,76 @@ def _bank_from(rel_parts: list[str], scope: str) -> str | None:
     return None
 
 
-def walk(root: Path, settings: Settings = DEFAULTS) -> list[Document]:
+def seed_document(source_key: str, path: str, filename: str, size_bytes: int,
+                  info: PathInfo, **extra) -> Document:
+    """Build the seed Document + its discovery event and path flags.
+
+    Shared by the local and Drive walkers so the two can't drift apart in what
+    they flag.
+    """
+    doc = Document(
+        id=doc_id_for(source_key),
+        path=path,
+        filename=filename,
+        size_bytes=size_bytes,
+        source_key=source_key,
+        path_info=info,
+        **extra,
+    )
+    record(doc, "walk", "discovered",
+           f"fy={info.fy} month={info.month} date={info.date_folder} "
+           f"company={info.company}", company=info.company, fy=info.fy)
+    if info.company is None:
+        doc.add_flag("no_company_folder", "could not derive company from path")
+    if not (info.fy and info.month and info.date_folder):
+        doc.add_flag("path_incomplete", "missing FY/month/date folder level")
+    return doc
+
+
+def _is_candidate(name: str) -> bool:
+    suffix = Path(name).suffix.lower()
+    return (name not in IGNORE_FILENAMES
+            and suffix not in IGNORE_SUFFIXES
+            and suffix in CANDIDATE_SUFFIXES)
+
+
+def walk(root: Path, settings: Settings = DEFAULTS,
+         control: Optional[RunControl] = None) -> Iterator[Document]:
+    """Yield seed Documents for every in-scope PDF under ``root``.
+
+    Streams (os.walk, sorted at each level) rather than materializing the tree, so
+    the pipeline can start on the first PDF immediately. Deterministic order.
+    """
     root = Path(root)
-    docs: list[Document] = []
-    idx = 0
 
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        if path.name in IGNORE_FILENAMES:
-            continue
-        if path.suffix.lower() in IGNORE_SUFFIXES:
-            continue
-        if path.suffix.lower() not in CANDIDATE_SUFFIXES:
-            continue
-
-        rel_parts = list(path.relative_to(root).parts)
-        folder_parts = rel_parts[:-1]  # exclude the filename itself
+    for dirpath, dirnames, filenames in os.walk(root):
+        if control is not None:
+            control.gate()          # a Stop during discovery lands here
+        dirnames.sort()             # deterministic descent
+        here = Path(dirpath)
+        folder_parts = list(here.relative_to(root).parts)
 
         # Scope gate: only PDFs under .../Payments/<scope>/...
         bank = _bank_from(folder_parts, settings.bank_scope)
         if not bank or bank.lower() != settings.bank_scope.lower():
             continue
 
-        info = _parse_path(folder_parts)
-        info.bank = info.bank or bank
+        info_base = _parse_path(folder_parts)
+        info_base.bank = info_base.bank or bank
 
-        doc = Document(
-            id=f"d{idx:05d}",
-            path=str(path.resolve()),
-            filename=path.name,
-            size_bytes=path.stat().st_size,
-            path_info=info,
-        )
-        record(doc, "walk", "discovered",
-               f"fy={info.fy} month={info.month} date={info.date_folder} company={info.company}",
-               company=info.company, fy=info.fy)
-        if info.company is None:
-            doc.add_flag("no_company_folder", "could not derive company from path")
-        if not (info.fy and info.month and info.date_folder):
-            doc.add_flag("path_incomplete", "missing FY/month/date folder level")
-        docs.append(doc)
-        idx += 1
-
-    return docs
+        for name in sorted(filenames):
+            if not _is_candidate(name):
+                continue
+            path = here / name
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            resolved = str(path.resolve())
+            yield seed_document(
+                source_key=f"local:{resolved}",   # stable key for the resume skip-list
+                path=resolved,
+                filename=name,
+                size_bytes=size,
+                info=info_base.model_copy(deep=True),
+            )

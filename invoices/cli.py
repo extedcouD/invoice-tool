@@ -38,13 +38,22 @@ def cmd_scan(args) -> None:
         workers=args.workers,
         ocr_enabled=not args.no_ocr,
     )
-    store, result = run_scan(Path(args.root), Path(args.out), settings, quiet=args.quiet)
+    gstr = Path(args.gstr) if getattr(args, "gstr", None) else None
+    store, result = run_scan(Path(args.root), Path(args.out), settings,
+                             quiet=args.quiet, gstr_path=gstr)
     s = result.summary()
     print(f"\nrun: {store.dir}")
     print(f"  detections: {store.detections_path}")
     print(f"  draft xlsx: {store.master_path()}")
     print(f"  invoices={s['invoices']} flagged={s['flagged']} "
           f"ocr={s['ocr_docs']} avg_conf={s['avg_invoice_confidence']}")
+    plan = store.load_link()
+    if plan is not None:
+        c = plan.counts()
+        print(f"  GSTR-2A: matched {c['matched']}/{c['total']} B2B rows "
+              f"({c['not_found']} no PDF, {c['ambiguous']} ambiguous, "
+              f"{c['unreferenced']} invoice(s) with no row)")
+        print("  open the review app to resolve them, then Finish & export")
     if not args.no_serve:
         from .web.app import serve
         print("\nlaunching review app (Ctrl-C to stop)…")
@@ -96,6 +105,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sc = sub.add_parser("scan", parents=[web], help="scan a folder tree and detect invoices")
     sc.add_argument("--root", required=True, help="root folder to scan (FY.. tree)")
+    sc.add_argument("--gstr", help="GSTR-2A workbook to match against (enables the "
+                                   "linking review: which B2B rows have no PDF)")
     sc.add_argument("--workers", type=int, default=1)
     sc.add_argument("--no-ocr", action="store_true", help="disable OCR fallback")
     sc.add_argument("--quiet", action="store_true", help="no live terminal progress")

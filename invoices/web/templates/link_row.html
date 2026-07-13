@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}B2B row {{ rm.row }} — find PDF{% endblock %}
+{% block body %}
+<p><a href="{{ url_for('review', tab='rows') }}">← back to unmatched rows</a></p>
+
+<h1>
+  {% if rm.status == 'ambiguous' %}Pick the right invoice for B2B row {{ rm.row }}
+  {% else %}Find the invoice for B2B row {{ rm.row }}{% endif %}
+</h1>
+
+<div class="card" style="margin-bottom:18px">
+  <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr))">
+    <div><label>supplier GSTIN</label><div class="mono">{{ rm.gstin or '—' }}</div></div>
+    <div><label>invoice number</label><div class="mono">{{ rm.invoice_no or '—' }}</div></div>
+    <div><label>supplier</label><div>{{ rm.supplier or '—' }}</div></div>
+    <div><label>invoice value</label><div class="mono">{{ rm.value or '—' }}</div></div>
+  </div>
+  {% if rm.manual %}
+  <div style="margin-top:12px">
+    <span class="pill ok">bound by hand</span>
+    <form method="post" action="{{ url_for('bind_row', row=rm.row) }}" style="display:inline">
+      <button class="btn ghost sm" type="submit">Undo this binding</button>
+    </form>
+  </div>
+  {% endif %}
+</div>
+
+<h2>
+  {% if q %}Search results for “{{ q }}”
+  {% elif rm.status == 'ambiguous' %}Conflicting candidates <span class="muted">— these all carry this invoice number under different GSTINs</span>
+  {% else %}Closest detected invoices <span class="muted">— ranked by how nearly they match</span>{% endif %}
+</h2>
+
+<form method="get" action="{{ url_for('link_row', row=rm.row) }}"
+      class="flex" style="gap:10px;align-items:center;margin-bottom:14px">
+  <div class="col"><input name="q" value="{{ q }}" autocomplete="off"
+       placeholder="Search all detected invoices by number, vendor, GSTIN or filename…"></div>
+  <button class="btn ghost" type="submit">Search</button>
+  {% if q %}<a class="btn ghost" href="{{ url_for('link_row', row=rm.row) }}">Clear</a>{% endif %}
+</form>
+
+{% if not scored %}
+  <div class="card">
+    <span class="pill bad">nothing close</span>
+    No detected invoice resembles this row. Either the PDF was never filed, or it
+    wasn't detected as an invoice — try searching by filename above.
+  </div>
+{% else %}
+<table>
+  <tr><th>invoice id</th><th>vendor (PDF)</th><th>GSTIN</th><th>date</th>
+      <th>conf</th>{% if not q %}<th>match</th>{% endif %}<th></th></tr>
+  {% for d, s in scored %}
+  <tr>
+    <td class="mono">{{ d.fields.invoice_id or d.filename }}</td>
+    <td class="muted">{{ d.fields.vendor_name_pdf or '—' }}</td>
+    <td class="mono muted">{{ d.fields.vendor_gstin or '—' }}</td>
+    <td class="muted">{{ d.fields.invoice_date or '—' }}</td>
+    <td><span class="pill {{ 'bad' if d.confidence<0.6 else 'warn' if d.confidence<0.8 else 'ok' }}">{{ '%.2f'|format(d.confidence) }}</span></td>
+    {% if not q %}
+    <td>{% if s is not none %}
+      <span class="pill {{ 'ok' if s>=85 else 'warn' if s>=60 else 'info' }}">{{ s|round(0)|int }}%</span>
+    {% else %}<span class="muted">—</span>{% endif %}</td>
+    {% endif %}
+    <td class="right" style="white-space:nowrap">
+      <a class="btn ghost sm" href="{{ url_for('doc_detail', doc_id=d.id) }}">Preview</a>
+      <form method="post" action="{{ url_for('bind_row', row=rm.row) }}" style="display:inline">
+        <input type="hidden" name="doc_id" value="{{ d.id }}">
+        <button class="btn sm" type="submit">Bind to row {{ rm.row }}</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="muted" style="margin-top:12px">
+  Binding is remembered for this run and is honoured by the final export — the PDF
+  is copied into the flat folder and its name written into the row's
+  <span class="mono">Invoice Ref</span> cell.
+</p>
+{% endif %}
+{% endblock %}

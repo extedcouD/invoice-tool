@@ -31,3 +31,20 @@ class TextSource(ABC):
     @abstractmethod
     def extract(self, doc: Document) -> tuple[str, str]:
         """Return (text, source_kind). source_kind in {'text','ocr','none'}."""
+
+
+class FileSource(ABC):
+    """Strategy for making a document's PDF bytes available as a local file.
+
+    Decouples *where* a PDF lives (local disk, Google Drive, …) from the
+    extract/OCR/review code, which only ever needs a readable local path. A
+    remote source downloads to a temp file in :meth:`materialize` and removes it
+    in :meth:`cleanup`; the local source is a no-op passthrough of ``doc.path``.
+    """
+
+    @abstractmethod
+    def materialize(self, doc: Document) -> str:
+        """Return a local filesystem path to this document's PDF bytes."""
+
+    def cleanup(self, doc: Document, path: str) -> None:  # noqa: B027 - optional hook
+        """Release anything :meth:`materialize` allocated (no-op for local)."""

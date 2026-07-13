@@ -20,6 +20,8 @@ jobs:
           - os: windows-latest
             artifact: InvoiceGSTRLinker-Windows
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write   # needed to attach the build to a GitHub Release on tags
     steps:
       - uses: actions/checkout@v4
 
@@ -58,3 +60,12 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.zip
           if-no-files-found: error
+
+      # On a v* tag, also publish the zip as a downloadable GitHub Release asset
+      # so "install from GitHub tags" yields a real download (not just an
+      # Actions artifact that expires and needs a login to fetch).
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}.zip

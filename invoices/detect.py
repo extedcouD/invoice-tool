@@ -8,15 +8,20 @@ from __future__ import annotations
 
 import shutil
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from typing import Callable, Iterable, Optional
 
 from .config import Settings, DEFAULTS
-from .core.models import DocType, RunResult
+from .core.control import RunControl
+from .core.interfaces import FileSource
+from .core.models import Document, DocType, RunResult
 from .core.pipeline import Pipeline
 from .io.excel import write_master
 from .io.pdf import PdfTextSource
 from .io.runstore import RunStore
+from .io.sources import LocalFileSource
 from .matching import vendor as vendormatch
 from .observability.events import record
 from .observability.progress import MultiReporter, RichReporter, StatusWriter, Reporter
@@ -27,11 +32,17 @@ from .stages.reconcile import ReconcileStage
 from .stages.validate import ValidateStage
 from .stages.walk import walk
 
+# A walker streams seed Documents from a root (local path or Drive folder id),
+# checking in with the RunControl as it goes.
+Walker = Callable[..., Iterable[Document]]
 
-def build_pipeline(settings: Settings, reporter: Reporter) -> Pipeline:
+
+def build_pipeline(settings: Settings, reporter: Reporter,
+                   file_source: FileSource | None = None,
+                   control: RunControl | None = None) -> Pipeline:
     return Pipeline(
         stages=[
-            ExtractStage(PdfTextSource(settings)),
+            ExtractStage(PdfTextSource(settings, file_source, control=control)),
             ClassifyStage(settings),
             ParseStage(),
             ReconcileStage(settings),
@@ -39,6 +50,7 @@ def build_pipeline(settings: Settings, reporter: Reporter) -> Pipeline:
         ],
         reporter=reporter,
         workers=settings.workers,
+        control=control,
     )
 
 
@@ -83,49 +95,173 @@ def _flag_duplicate_ids(result: RunResult) -> None:
                        f"{inv_id} x{len(docs)}", severity="warn")
 
 
-def _copy_flagged(result: RunResult, store: RunStore) -> None:
-    for d in result.documents:
-        if not d.needs_review:
-            continue
-        src = Path(d.path)
-        dest = store.review_dir / f"{d.id}__{src.name}"
-        try:
-            shutil.copy2(src, dest)
-            d.review_pdf_path = str(dest.resolve())  # absolute so the web app can serve it
-        except OSError as exc:
-            record(d, "review", "copy_failed", str(exc), severity="warn")
+def _copy_one_flagged(d: Document, store: RunStore, file_source: FileSource) -> None:
+    dest = store.review_dir / f"{d.id}__{d.filename}"
+    try:
+        local = file_source.materialize(d)
+    except Exception as exc:  # a failed fetch shouldn't sink the run
+        record(d, "review", "fetch_failed", str(exc), severity="warn")
+        return
+    try:
+        shutil.copy2(local, dest)
+        d.review_pdf_path = str(dest.resolve())  # absolute so the web app can serve it
+    except OSError as exc:
+        record(d, "review", "copy_failed", str(exc), severity="warn")
+    finally:
+        file_source.cleanup(d, local)
 
 
-def run_scan(root: Path, out_root: Path, settings: Settings = DEFAULTS,
-             quiet: bool = False, store: RunStore | None = None) -> tuple[RunStore, RunResult]:
-    root = Path(root)
-    # A caller (e.g. the desktop RunController) may pre-create the run dir so it
-    # can poll status.json from t=0; otherwise mint a fresh one here.
+def _copy_flagged(result: RunResult, store: RunStore, file_source: FileSource,
+                  workers: int = 4) -> None:
+    """Pre-copy flagged PDFs into the run's review folder so the web UI can serve
+    them. Bytes come through the FileSource, so a Drive-hosted doc is downloaded
+    here.
+
+    Done in parallel: on a Drive run this is one network download per flagged doc,
+    and serially it was the single longest part of the shutdown path. It is also
+    only an optimization — ``/pdf/<id>`` materializes on demand for anything not
+    copied — so a stopped run skips it entirely.
+    """
+    flagged = [d for d in result.documents if d.needs_review]
+    if not flagged:
+        return
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        list(ex.map(lambda d: _copy_one_flagged(d, store, file_source), flagged))
+
+
+def run_scan(root, out_root: Path, settings: Settings = DEFAULTS,
+             quiet: bool = False, store: RunStore | None = None,
+             file_source: FileSource | None = None,
+             walker: Optional[Walker] = None,
+             root_key: str | None = None,
+             control: "RunControl | None" = None,
+             gstr_path: Path | None = None,
+             on_phase: Optional[Callable[[str], None]] = None) -> tuple[RunStore, RunResult]:
+    """Scan a tree (local path or, via ``walker``/``file_source``, a Drive folder).
+
+    Resumable: if ``store`` already holds a checkpoint (an interrupted run reopened
+    by the caller), every source already recorded is skipped and only the
+    remainder is processed; the final result is assembled from the full ledger.
+
+    ``control`` (optional) lets the caller pause/stop the scan. A stopped run still
+    writes its partial detections + master from the docs that *did* finish, but is
+    deliberately left marked **incomplete** so the next run over the same input
+    resumes it instead of starting over.
+
+    ``gstr_path`` (optional): match the detected invoices against the GSTR-2A return
+    as soon as the scan ends. Matching is pure and in-memory, so this is cheap — and
+    it is what lets the review UI open on "74 B2B rows have no PDF" instead of that
+    only becoming knowable after review, at export time.
+
+    ``on_phase`` reports the coarse phase ("scanning" / "linking" / "finishing") so
+    the UI can stop claiming to scan while it is really writing a workbook.
+    """
+    file_source = file_source or LocalFileSource()
+    walker = walker or walk
+    # A caller (e.g. the desktop RunController) may pre-create/reopen the run dir
+    # so it can poll status.json from t=0; otherwise mint a fresh one here.
     store = store or RunStore.new(out_root)
+    # root_key identifies the input for resume-matching; for a local path it's the
+    # resolved path, for Drive the caller passes the folder id explicitly.
+    root_key = root_key if root_key is not None else str(Path(root).resolve())
+    store.write_meta(root=root_key, complete=False)
+
+    def phase(name: str) -> None:
+        if on_phase is not None:
+            on_phase(name)
 
     reporter = MultiReporter(
-        StatusWriter(store.status_path),
+        StatusWriter(store.status_path, control=control),
         None if quiet else RichReporter(),
     )
 
     started = datetime.now().isoformat(timespec="seconds")
-    docs = walk(root, settings)
-    pipeline = build_pipeline(settings, reporter)
-    docs = pipeline.run(docs)
+    phase("scanning")
+
+    # The walker is a generator: the pipeline pulls from it, so discovery and
+    # processing overlap and Stop is honoured *during* the walk.
+    pipeline = build_pipeline(settings, reporter, file_source, control=control)
+    pipeline.run(walker(root, settings, control=control),
+                 on_doc_done=store.append_checkpoint,
+                 skip_keys=store.done_keys())          # empty for a fresh run
+
+    # Assemble from the durable ledger (already-done + this batch), so a resumed
+    # run yields the same complete corpus as an uninterrupted one.
+    phase("finishing")
+    documents = store.checkpoint_docs()
+    documents.sort(key=lambda d: d.path)   # deterministic regardless of completion order
+
+    # Complete iff we actually reached the end of the tree. This is the single
+    # source of truth for resumability: deriving it from "did the user press Stop"
+    # instead meant a Stop landing as the run drained marked the run complete but
+    # showed the resume screen — and the resume then silently rescanned from zero.
+    complete = not pipeline.cancelled and pipeline.discovery_complete
 
     result = RunResult(
         run_id=store.run_id,
-        root=str(root.resolve()),
+        root=root_key,
         started_at=started,
-        documents=docs,
+        complete=complete,
+        documents=documents,
         stage_metrics=pipeline.metrics(),
     )
     _canonicalize_vendors(result)
     _flag_duplicate_ids(result)
-    _copy_flagged(result, store)
-    result.finished_at = datetime.now().isoformat(timespec="seconds")
 
+    if gstr_path is not None:
+        phase("linking")
+        try:
+            link_now(result, gstr_path, store)
+            store.update_meta(link_error=None)
+        except Exception as exc:   # a bad workbook must not sink a good scan
+            store.update_meta(link_error=str(exc))
+
+    # Only an optimization (see _copy_flagged), and the longest part of the
+    # shutdown path on Drive — a stopped run skips it and gets the user out.
+    if not pipeline.cancelled:
+        phase("finishing")
+        _copy_flagged(result, store, file_source, workers=settings.workers)
+
+    result.finished_at = datetime.now().isoformat(timespec="seconds")
     store.save(result)
     write_master(result, store.master_path())
+    store.write_meta(root=root_key, complete=complete)
     reporter.finish(result.summary())
     return store, result
+
+
+def link_now(result: RunResult, gstr_path: Path, store: RunStore,
+             file_source: FileSource | None = None):
+    """(Re)match the detected invoices against the GSTR-2A return and persist.
+
+    Pure matching only — no PDF copying, no workbook written. Cheap enough to call
+    after every single review edit, which is what lets the UI tell a reviewer
+    "the GSTIN you just fixed now matches B2B row 143".
+    """
+    from .io.gstr import apply_plan, match, read_b2b_rows
+
+    gstr_path = _keep_gstr_with_run(Path(gstr_path), store)
+    rows = read_b2b_rows(gstr_path)
+    plan = match(rows, result.invoices(), store.manual_links())
+    apply_plan(result, plan)
+    store.save_link(plan)
+    return plan
+
+
+def _keep_gstr_with_run(gstr_path: Path, store: RunStore) -> Path:
+    """Copy the return into the run dir and remember it by absolute path.
+
+    The run dir is the single source of truth, and the workbook has to survive with
+    it: on a Drive run the caller hands us a *temp* download that will vanish, and a
+    path typed at the CLI is relative to whatever cwd that invocation had. Either
+    way, reopening the run later (`invoices review`) could no longer find the return
+    and "Finish & export" would claim none was ever chosen.
+    """
+    kept = store.dir / gstr_path.name
+    try:
+        if not kept.exists() or not gstr_path.samefile(kept):
+            shutil.copy2(gstr_path, kept)
+    except OSError:
+        kept = gstr_path          # unreadable/unwritable — carry on with the original
+    store.update_meta(gstr_path=str(Path(kept).resolve()))
+    return kept

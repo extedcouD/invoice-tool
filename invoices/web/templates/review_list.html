@@ -1,47 +1,172 @@
 {% extends "base.html" %}
-{% block title %}Review queue — invoices{% endblock %}
+{% block title %}Review — invoices{% endblock %}
 {% block body %}
-<div style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap">
-  <h1 style="margin:0">Review queue <span class="muted">({{ docs|length }} of {{ total }} PDFs)</span></h1>
-  <div style="display:flex;gap:10px;flex-wrap:wrap">
-    {% if docs %}
-    <form method="post" action="{{ url_for('approve_all') }}"
-          onsubmit="return confirm('Approve all {{ docs|length }} flagged document(s) as-is? This marks them reviewed without edits.')">
-      <button class="btn" type="submit">✓ Approve all ({{ docs|length }})</button>
-    </form>
-    {% endif %}
-    <form method="post" action="{{ url_for('finish') }}"
-          onsubmit="return confirm({% if docs %}'Export now? {{ docs|length }} document(s) are still unreviewed and will be exported as-is.'{% else %}'Export the final GSTR-linked workbook and matched-invoice folder now?'{% endif %})">
-      <button class="btn ghost" type="submit">Finish &amp; export →</button>
-    </form>
-  </div>
-</div>
-<p class="muted">Sorted worst-first. Click a row to preview the PDF and confirm/correct.</p>
 
-{% if not docs %}
-  <div class="card"><span class="pill ok">all clear</span> nothing needs review.</div>
-{% else %}
-<table>
-  <tr><th>id</th><th>company (folder)</th><th>vendor (PDF)</th><th>conf</th>
-      <th>src</th><th>flags</th></tr>
-  {% for d in docs %}
-  <tr onclick="location.href='{{ url_for('doc_detail', doc_id=d.id) }}'" style="cursor:pointer">
-    <td class="mono">{{ d.fields.invoice_id or '—' }}</td>
-    <td>{{ d.path_info.company or '—' }}</td>
-    <td class="muted">{{ d.fields.vendor_name_pdf or '—' }}</td>
-    <td>
-      {% set c = d.confidence %}
-      <span class="pill {{ 'bad' if c<0.6 else 'warn' if c<0.8 else 'ok' }}">{{ '%.2f'|format(c) }}</span>
-    </td>
-    <td><span class="pill {{ 'warn' if d.source.value=='ocr' else 'info' }}">{{ d.source.value }}</span></td>
-    <td>
-      {% for f in d.flags %}
-        <span class="pill {{ 'bad' if f.severity.value=='error' else 'warn' if f.severity.value=='warn' else 'info' }}"
-              title="{{ f.message }}">{{ f.code }}</span>
+{% macro linkpill(d) %}
+  {% if d.link_status.value == 'matched' %}
+    <span class="pill ok" title="satisfies B2B row {{ d.gstr_row }}">row {{ d.gstr_row }}</span>
+  {% elif d.link_status.value == 'ambiguous' %}
+    <span class="pill warn">ambiguous</span>
+  {% elif d.link_status.value == 'unreferenced' %}
+    <span class="pill bad" title="this invoice satisfies no B2B row in the return">no row</span>
+  {% else %}
+    <span class="pill info">—</span>
+  {% endif %}
+{% endmacro %}
+
+<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap">
+  <div>
+    <h1 style="margin:0 0 4px">Review</h1>
+    {% if counts %}
+    <div class="muted">
+      Matched <b style="color:var(--ok)">{{ counts.matched }}</b> of {{ counts.total }} B2B rows
+      {% if counts.not_found %}· <b style="color:var(--bad)">{{ counts.not_found }}</b> with no PDF{% endif %}
+      {% if counts.ambiguous %}· <b style="color:var(--warn)">{{ counts.ambiguous }}</b> ambiguous{% endif %}
+      {% if counts.unreferenced %}· {{ counts.unreferenced }} invoice(s) with no row{% endif %}
+    </div>
+    {% else %}
+    <div class="muted">
+      No GSTR-2A workbook was chosen for this run — detection only.
+      {{ invoice_count }} invoice(s) of {{ total }} PDFs.
+    </div>
+    {% endif %}
+  </div>
+  {% if not locked %}
+  <form method="post" action="{{ url_for('finish') }}"
+        onsubmit="return confirm({% if flagged %}'Export now? {{ flagged|length }} document(s) are still unreviewed and will be exported as-is.'{% else %}'Write the final GSTR-linked workbook and matched-invoice folder now?'{% endif %})">
+    <button class="btn big" type="submit">Finish &amp; export →</button>
+  </form>
+  {% endif %}
+</div>
+
+{% if locked %}
+<div class="banner warn" style="margin-top:14px">
+  The scan is still running — this is what has been found <b>so far</b>, and it is
+  read-only until the scan finishes. Browse freely; edits and exporting unlock at the end.
+</div>
+{% endif %}
+
+{% if counts and counts.matched == counts.total and not counts.unreferenced %}
+<div class="banner" style="margin-top:14px">
+  ✓ Every B2B row is matched to an invoice PDF. Nothing left to resolve.
+</div>
+{% endif %}
+
+<div class="tabs">
+  <a href="{{ url_for('review', tab='rows') }}" class="{{ 'on' if tab == 'rows' }}">
+    GSTR rows with no PDF <span class="n">{{ rows|length }}</span></a>
+  <a href="{{ url_for('review', tab='invoices') }}" class="{{ 'on' if tab == 'invoices' }}">
+    Invoices with no row <span class="n">{{ unlinked|length }}</span></a>
+  <a href="{{ url_for('review', tab='flagged') }}" class="{{ 'on' if tab == 'flagged' }}">
+    Low confidence <span class="n">{{ flagged|length }}</span></a>
+</div>
+
+<div style="height:16px"></div>
+
+{# ---- 1 · B2B rows the scan could not find a PDF for ----------------------- #}
+{% if tab == 'rows' %}
+  {% if not plan %}
+    <div class="card"><span class="pill info">no return</span>
+      This run had no GSTR-2A workbook, so there are no B2B rows to match.</div>
+  {% elif not rows %}
+    <div class="card"><span class="pill ok">all clear</span>
+      Every B2B row in the return matched an invoice PDF.</div>
+  {% else %}
+    <p class="muted">These rows are in the return but no invoice PDF was found for them.
+       This is the list the client actually cares about.</p>
+    <table>
+      <tr><th>row</th><th>supplier GSTIN</th><th>invoice no</th><th>supplier</th>
+          <th>status</th><th></th></tr>
+      {% for r in rows %}
+      <tr>
+        <td class="mono muted">{{ r.row }}</td>
+        <td class="mono">{{ r.gstin or '—' }}</td>
+        <td class="mono">{{ r.invoice_no or '—' }}</td>
+        <td class="muted">{{ r.supplier or '—' }}</td>
+        <td>
+          {% if r.status == 'ambiguous' %}
+            <span class="pill warn">ambiguous ({{ r.candidates|length }})</span>
+          {% else %}
+            <span class="pill bad">not found</span>
+          {% endif %}
+        </td>
+        <td class="right">
+          {% if not locked %}
+          <a class="btn ghost sm" href="{{ url_for('link_row', row=r.row) }}">
+            {{ 'Pick one…' if r.status == 'ambiguous' else 'Find PDF…' }}</a>
+          {% endif %}
+        </td>
+      </tr>
       {% endfor %}
-    </td>
-  </tr>
-  {% endfor %}
-</table>
+    </table>
+  {% endif %}
+
+{# ---- 2 · detected invoices that satisfy no row (the reverse gap) ---------- #}
+{% elif tab == 'invoices' %}
+  {% if not plan %}
+    <div class="card"><span class="pill info">no return</span>
+      This run had no GSTR-2A workbook to match against.</div>
+  {% elif not unlinked %}
+    <div class="card"><span class="pill ok">all clear</span>
+      Every detected invoice is referenced by a B2B row.</div>
+  {% else %}
+    <p class="muted">These PDFs were detected as invoices but match no row in the return —
+       either the return is missing them, or their GSTIN / invoice number was read wrong.
+       Open one to correct it; if it isn't an invoice at all, reject it.</p>
+    <table>
+      <tr><th>invoice id</th><th>company (folder)</th><th>vendor (PDF)</th>
+          <th>GSTIN</th><th>conf</th><th>src</th></tr>
+      {% for d in unlinked %}
+      <tr onclick="location.href='{{ url_for('doc_detail', doc_id=d.id) }}'" style="cursor:pointer">
+        <td class="mono">{{ d.fields.invoice_id or '—' }}</td>
+        <td>{{ d.path_info.company or '—' }}</td>
+        <td class="muted">{{ d.fields.vendor_name_pdf or '—' }}</td>
+        <td class="mono muted">{{ d.fields.vendor_gstin or '—' }}</td>
+        <td><span class="pill {{ 'bad' if d.confidence<0.6 else 'warn' if d.confidence<0.8 else 'ok' }}">{{ '%.2f'|format(d.confidence) }}</span></td>
+        <td><span class="pill {{ 'warn' if d.source.value=='ocr' else 'info' }}">{{ d.source.value }}</span></td>
+      </tr>
+      {% endfor %}
+    </table>
+  {% endif %}
+
+{# ---- 3 · the old low-confidence queue, now with link status --------------- #}
+{% else %}
+  {% if not flagged %}
+    <div class="card"><span class="pill ok">all clear</span> nothing needs review.</div>
+  {% else %}
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+      <p class="muted" style="margin:0">Sorted worst-first. Click a row to preview the PDF and confirm/correct.</p>
+      {% if not locked %}
+      <form method="post" action="{{ url_for('approve_all') }}"
+            onsubmit="return confirm('Approve all {{ flagged|length }} flagged document(s) as-is? This marks them reviewed without edits.')">
+        <button class="btn ghost sm" type="submit">✓ Approve all ({{ flagged|length }})</button>
+      </form>
+      {% endif %}
+    </div>
+    <div style="height:10px"></div>
+    <table>
+      <tr><th>id</th><th>company (folder)</th><th>vendor (PDF)</th><th>GSTR</th>
+          <th>conf</th><th>src</th><th>flags</th></tr>
+      {% for d in flagged %}
+      <tr onclick="location.href='{{ url_for('doc_detail', doc_id=d.id) }}'" style="cursor:pointer">
+        <td class="mono">{{ d.fields.invoice_id or '—' }}</td>
+        <td>{{ d.path_info.company or '—' }}</td>
+        <td class="muted">{{ d.fields.vendor_name_pdf or '—' }}</td>
+        <td>{% if d.is_invoice %}{{ linkpill(d) }}{% else %}<span class="muted">—</span>{% endif %}</td>
+        <td>
+          {% set c = d.confidence %}
+          <span class="pill {{ 'bad' if c<0.6 else 'warn' if c<0.8 else 'ok' }}">{{ '%.2f'|format(c) }}</span>
+        </td>
+        <td><span class="pill {{ 'warn' if d.source.value=='ocr' else 'info' }}">{{ d.source.value }}</span></td>
+        <td>
+          {% for f in d.flags %}
+            <span class="pill {{ 'bad' if f.severity.value=='error' else 'warn' if f.severity.value=='warn' else 'info' }}"
+                  title="{{ f.message }}">{{ f.code }}</span>
+          {% endfor %}
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+  {% endif %}
 {% endif %}
 {% endblock %}

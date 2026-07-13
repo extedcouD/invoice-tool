@@ -113,16 +113,29 @@ class WebviewApi:
 # Headless CLI (frozen-bundle smoke test / automation)
 # --------------------------------------------------------------------------- #
 def _run_pipeline(invoice_root: Path, gstr_path: Path):
-    """Blocking scan + link. Returns (store, report)."""
+    """Blocking scan + match + write the linked workbook. Returns (store, report).
+
+    The headless path has no reviewer, so it does in one shot what the UI splits
+    across review: `run_scan(gstr_path=...)` matches, and `write_linked` exports.
+    """
     from dataclasses import replace
 
     from .config import DEFAULTS
     from .detect import run_scan
-    from .io.gstr import link_gstr
+    from .io.gstr import write_linked
 
     settings = replace(DEFAULTS, workers=4)
-    store, result = run_scan(invoice_root, OUTPUT_ROOT, settings, quiet=True)
-    report = link_gstr(result, gstr_path, store)
+    store, result = run_scan(invoice_root, OUTPUT_ROOT, settings, quiet=True,
+                             gstr_path=gstr_path)
+    plan = store.load_link()
+    if plan is None:
+        # run_scan deliberately swallows a bad workbook so it can't sink a good
+        # scan; headless has no reviewer to tell, so surface it here rather than
+        # dying on `None.counts()` inside write_linked.
+        raise RuntimeError(
+            "the scan succeeded but the GSTR-2A workbook could not be matched: "
+            + (store.read_meta().get("link_error") or "unknown error"))
+    report = write_linked(result, plan, gstr_path, store)
     return store, report
 
 
@@ -144,9 +157,38 @@ def _run_cli(argv: list[str]) -> int:
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
+def _selftest() -> int:
+    """Verify the frozen bundle can load the Drive backend + its discovery doc.
+
+    Complements --cli (which exercises the pipeline): this catches missing
+    PyInstaller hidden-imports for the Google API libraries before a release,
+    without needing credentials or a network. Run: InvoiceGSTRLinker --selftest
+    """
+    from .io.drive import (DriveClient, walk_drive, folder_id_from,  # noqa: F401
+                           bundled_client_secret)
+    from googleapiclient.discovery import build
+    # static_discovery reads the bundled drive.v3.json (no network, no auth).
+    build("drive", "v3", developerKey="selftest",
+          static_discovery=True, cache_discovery=False)
+    assert folder_id_from("https://drive.google.com/drive/folders/ABC123") == "ABC123"
+
+    # A frozen build with no OAuth client can't sign in to Drive at all, and the
+    # failure would only show up in front of a user. Fail the release instead.
+    if getattr(sys, "frozen", False) and bundled_client_secret() is None:
+        print("selftest FAILED: no client_secret.json in the bundle — Drive sign-in "
+              "would be unavailable. Set INVOICES_CLIENT_SECRET_FILE and rebuild.")
+        return 1
+
+    print("selftest OK: drive backend imports + discovery doc load"
+          + (" + bundled OAuth client" if bundled_client_secret() else ""))
+    return 0
+
+
 def main() -> None:
     configure_bundled_tesseract()
     argv = sys.argv[1:]
+    if argv[:1] == ["--selftest"]:
+        raise SystemExit(_selftest())
     if argv[:1] == ["--cli"]:
         raise SystemExit(_run_cli(argv[1:]))
 

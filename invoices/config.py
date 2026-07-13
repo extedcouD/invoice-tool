@@ -119,6 +119,9 @@ MASTER_COLUMNS = [
     "invoice_id", "company", "vendor_name_pdf", "vendor_gstin",
     "invoice_date", "taxable_value", "total_value",
     "bill_to_name", "bill_to_gstin",
+    # GSTR-2A linking — the point of the tool, so it sits next to the identity
+    # fields rather than at the far right of the sheet.
+    "link_status", "gstr_row", "gstr_ref",
     "fy", "month", "date_folder", "bank",
     "source", "confidence", "reviewed", "flags", "rel_path", "file_path",
 ]
