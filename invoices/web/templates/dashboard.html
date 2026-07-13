@@ -6,12 +6,12 @@
   root <span class="mono">{{ r.root }}</span> · scanned {{ r.started_at }} · finished {{ r.finished_at }}
 </div>
 
-<div id="live" class="card" style="margin-bottom:16px;display:none">
-  <div class="k">pipeline status</div>
-  <div class="v" id="live-stage" style="font-size:18px">—</div>
-  <div class="bar" style="margin-top:8px"><span id="live-bar" style="width:0%"></span></div>
-  <div class="muted mono" id="live-counts" style="margin-top:6px"></div>
+{% if not r.complete %}
+<div class="banner warn">
+  This run is still in progress or was stopped — the numbers below are what has been
+  scanned so far, not the whole tree.
 </div>
+{% endif %}
 
 <div class="grid cards">
   <div class="card"><div class="k">PDFs</div><div class="v">{{ summary.total_pdfs }}</div></div>
@@ -48,21 +48,4 @@
 <h2>Review queue</h2>
 <p>{{ summary.flagged }} document(s) need a human look.
    <a class="btn ghost" href="{{ url_for('review') }}">Open review queue →</a></p>
-
-<script>
-async function poll(){
-  try{
-    const r = await fetch("{{ url_for('status') }}"); const s = await r.json();
-    if(s.state === "running"){
-      document.getElementById("live").style.display = "block";
-      document.getElementById("live-stage").textContent = "stage: " + (s.stage||"—");
-      document.getElementById("live-bar").style.width = (s.pct||0) + "%";
-      document.getElementById("live-counts").textContent =
-        Object.entries(s.counts||{}).map(([k,v])=>k+"="+v).join("  ");
-      setTimeout(poll, 700);
-    }
-  }catch(e){}
-}
-poll();
-</script>
 {% endblock %}

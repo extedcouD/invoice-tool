@@ -113,16 +113,29 @@ class WebviewApi:
 # Headless CLI (frozen-bundle smoke test / automation)
 # --------------------------------------------------------------------------- #
 def _run_pipeline(invoice_root: Path, gstr_path: Path):
-    """Blocking scan + link. Returns (store, report)."""
+    """Blocking scan + match + write the linked workbook. Returns (store, report).
+
+    The headless path has no reviewer, so it does in one shot what the UI splits
+    across review: `run_scan(gstr_path=...)` matches, and `write_linked` exports.
+    """
     from dataclasses import replace
 
     from .config import DEFAULTS
     from .detect import run_scan
-    from .io.gstr import link_gstr
+    from .io.gstr import write_linked
 
     settings = replace(DEFAULTS, workers=4)
-    store, result = run_scan(invoice_root, OUTPUT_ROOT, settings, quiet=True)
-    report = link_gstr(result, gstr_path, store)
+    store, result = run_scan(invoice_root, OUTPUT_ROOT, settings, quiet=True,
+                             gstr_path=gstr_path)
+    plan = store.load_link()
+    if plan is None:
+        # run_scan deliberately swallows a bad workbook so it can't sink a good
+        # scan; headless has no reviewer to tell, so surface it here rather than
+        # dying on `None.counts()` inside write_linked.
+        raise RuntimeError(
+            "the scan succeeded but the GSTR-2A workbook could not be matched: "
+            + (store.read_meta().get("link_error") or "unknown error"))
+    report = write_linked(result, plan, gstr_path, store)
     return store, report
 
 

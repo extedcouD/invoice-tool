@@ -6,7 +6,8 @@
 <div id="setup" style="display:none">
   <h1>Scan invoices &amp; link to GSTR-2A</h1>
   <p class="muted">Scan a <span class="mono">FY&nbsp;..</span> invoice tree — from a local folder or
-     straight from <b>Google Drive</b> — and optionally link a GSTR-2A workbook.</p>
+     straight from <b>Google Drive</b> — and link a GSTR-2A workbook to find which
+     B2B rows have no invoice PDF.</p>
   <div id="err" class="banner bad" style="display:none"></div>
   <div class="card" style="max-width:860px">
     <label>Source</label>
@@ -58,17 +59,20 @@
 
 <!-- 2 · LIVE -------------------------------------------------------------- -->
 <div id="live" style="display:none">
-  <h1><span class="spin"></span> <span id="phase-label">Scanning invoices…</span></h1>
+  <h1><span class="spin" id="live-spin"></span> <span id="phase-label">Scanning invoices…</span></h1>
   <div class="muted" id="live-sub" style="margin-bottom:14px">Starting…</div>
-  <div class="bar" style="height:10px"><span id="bar" style="width:0%"></span></div>
+  <div class="bar" id="barwrap" style="height:10px"><span id="bar" style="width:0%"></span></div>
   <div class="flex" style="justify-content:space-between;margin-top:6px">
     <span class="muted mono" id="progress-text">0 / 0</span>
     <span class="muted mono" id="eta-text"></span>
-    <span class="muted mono" id="pct-text">0%</span>
+    <span class="muted mono" id="pct-text"></span>
   </div>
-  <div class="flex" style="gap:10px;margin-top:14px">
+  <div class="flex" style="gap:10px;margin-top:14px;align-items:center;flex-wrap:wrap">
     <button class="btn ghost" id="pause" type="button">⏸ Pause</button>
     <button class="btn ghost" id="stop" type="button">⏹ Stop</button>
+    <!-- An escape hatch: these pages render the live checkpoint, so you can go
+         look at partial results without stopping the scan. -->
+    <a class="btn ghost" href="/review">Review what's done so far →</a>
     <span class="muted" id="stop-hint">Stopping is safe — progress is checkpointed, and running the same folder again resumes it.</span>
   </div>
   <div id="chips" class="grid cards" style="margin:16px 0"></div>
@@ -78,7 +82,7 @@
 
 <!-- 2b · STOPPED ----------------------------------------------------------- -->
 <div id="stopped" style="display:none">
-  <h1>⏸ Scan stopped</h1>
+  <h1>⏹ Scan stopped</h1>
   <div id="stopped-sub" class="muted" style="margin-bottom:16px"></div>
   <div id="stopped-cards" class="grid cards" style="margin-bottom:16px"></div>
   <div class="flex" style="gap:12px;flex-wrap:wrap">
@@ -92,10 +96,10 @@
   <h1>✓ Scan complete</h1>
   <div id="done-sub" class="muted" style="margin-bottom:16px"></div>
   <div id="done-cards" class="grid cards" style="margin-bottom:14px"></div>
-  <div id="link-line" class="muted" style="margin-bottom:18px"></div>
+  <div id="link-line" class="banner" style="display:none"></div>
   <div id="upload-line" class="muted" style="margin-bottom:14px"></div>
   <div class="flex" style="gap:12px;flex-wrap:wrap">
-    <a class="btn big" id="go-review" href="/review">Review flagged →</a>
+    <a class="btn big" id="go-review" href="/review">Open review →</a>
     <a class="btn big ghost" href="/dashboard">Open dashboard</a>
     <button class="btn big" id="drive-upload" type="button" style="display:none">☁️ Upload results to Drive</button>
     <button class="btn big ghost" id="open-out" type="button" style="display:none">Open output folder</button>
@@ -134,6 +138,11 @@ function setMode(m){
   $("local-fields").style.display = (m==="local") ? "block" : "none";
   $("drive-fields").style.display = (m==="drive") ? "block" : "none";
 }
+function setDriveConnected(on){
+  driveConnected = on;
+  $("drive-connect").style.display = on ? "none" : "block";
+  $("drive-connected").style.display = on ? "block" : "none";
+}
 $("src-local").onclick = () => setMode("local");
 $("src-drive").onclick = () => setMode("drive");
 
@@ -144,7 +153,7 @@ $("drive-auth").onclick = async () => {
     const r = await fetch("/api/drive/auth", {method:"POST"});
     const j = await r.json();
     if(!j.ok){ showErr(j.error || "Could not connect to Google Drive."); }
-    else { driveConnected = true; $("drive-connect").style.display="none"; $("drive-connected").style.display="block"; }
+    else setDriveConnected(true);
   }catch(e){ showErr(String(e)); }
   $("drive-auth").disabled = false; $("drive-auth").textContent = "🔗 Connect Google Drive";
 };
@@ -160,60 +169,62 @@ $("gstr-browse").onclick = async () => {
 };
 
 // ---- run -----------------------------------------------------------------
-$("run").onclick = async () => {
-  $("err").style.display = "none";
-  let payload;
+function currentPayload(){
   if(sourceMode === "drive"){
-    if(!driveConnected){ showErr("Connect Google Drive first."); return; }
+    if(!driveConnected){ showErr("Connect Google Drive first."); return null; }
     const folder = $("drive-folder").value.trim();
-    if(!folder){ showErr("Paste the Google Drive folder link or id."); return; }
-    payload = {source_mode:"drive", invoice: folder, gstr: $("drive-gstr").value.trim(),
-               upload_folder: $("drive-out").value.trim()};
-  } else {
-    const invoice = $("inv").value.trim();
-    if(!invoice){ showErr("Choose the invoice folder first."); return; }
-    payload = {source_mode:"local", invoice, gstr: $("gstr").value.trim()};
+    if(!folder){ showErr("Paste the Google Drive folder link or id."); return null; }
+    return {source_mode:"drive", invoice: folder, gstr: $("drive-gstr").value.trim(),
+            upload_folder: $("drive-out").value.trim()};
   }
-  $("run").disabled = true;
+  const invoice = $("inv").value.trim();
+  if(!invoice){ showErr("Choose the invoice folder first."); return null; }
+  return {source_mode:"local", invoice, gstr: $("gstr").value.trim()};
+}
+
+async function startRun(payload, btn){
+  if(btn) btn.disabled = true;
   try{
     const r = await fetch("/api/start", {method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify(payload)});
     const j = await r.json();
-    if(!j.ok){ showErr(j.error || "Could not start the run."); $("run").disabled = false; return; }
-    lastPayload = payload;          // so Stop → Resume can re-issue the same run
+    if(!j.ok){ show("setup"); showErr(j.error || "Could not start the run."); if(btn) btn.disabled = false; return; }
     if(j.resumed) $("phase-label").textContent = "Resuming previous scan…";
     resetLiveControls();
     show("live"); poll();
-  }catch(e){ showErr(String(e)); $("run").disabled = false; }
+  }catch(e){ showErr(String(e)); if(btn) btn.disabled = false; }
+}
+
+$("run").onclick = () => {
+  $("err").style.display = "none";
+  const payload = currentPayload();
+  if(payload) startRun(payload, $("run"));
 };
-let lastPayload = null;
 $("again").onclick = () => { show("setup"); $("run").disabled = false; };
 
 // ---- pause / stop --------------------------------------------------------
+// The button NEVER guesses its own state: /status reports it, read live off the
+// RunControl. (It used to flip optimistically and then be overwritten by a stale
+// status.json — which is why Resume was unreachable once you'd paused.)
 let paused = false;
 $("pause").onclick = async () => {
-  const r = await fetch(paused ? "/api/resume" : "/api/pause", {method:"POST"});
-  const j = await r.json();
-  if(j.ok) paused = !!j.paused;   // the button relabels on the next poll tick
+  $("pause").disabled = true;
+  try{ await fetch(paused ? "/api/resume" : "/api/pause", {method:"POST"}); }
+  finally{ $("pause").disabled = false; }
 };
 $("stop").onclick = async () => {
   $("stop").disabled = true;
   $("stop").textContent = "Stopping…";
-  $("stop-hint").textContent = "Letting the documents already in flight finish…";
   await fetch("/api/stop", {method:"POST"});
 };
 // Resuming is just starting the same input again — RunStore.find_resumable
 // reopens the interrupted run and the scan skips whatever is already checkpointed.
-$("resume-run").onclick = async () => {
-  if(!lastPayload) { show("setup"); return; }
-  $("resume-run").disabled = true;
-  const r = await fetch("/api/start", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify(lastPayload)});
-  const j = await r.json();
-  $("resume-run").disabled = false;
-  if(!j.ok){ show("setup"); showErr(j.error || "Could not resume."); return; }
-  resetLiveControls();
-  show("live"); poll();
+// The inputs come from the server (run_state.last_input), so this survives a
+// page reload or a trip through the review queue.
+$("resume-run").onclick = () => {
+  const payload = (INIT && INIT.last_input) || currentPayload();
+  if(!payload){ show("setup"); return; }
+  startRun(payload, $("resume-run"));
 };
 function resetLiveControls(){
   paused = false;
@@ -244,32 +255,58 @@ function renderChips(counts){
 
 let polling = false;
 async function poll(){
-  if(polling) return; polling = true;
+  if(polling) return;
+  polling = true;
+  let s, rs;
   try{
-    const [s, rs] = await Promise.all([
+    [s, rs] = await Promise.all([
       fetch("/status").then(r=>r.json()),
       fetch("/run_state").then(r=>r.json()),
     ]);
-    $("bar").style.width = (s.pct||0) + "%";
-    $("progress-text").textContent = (s.done||0) + " / " + (s.total||0);
-    $("pct-text").textContent = (s.pct||0) + "%";
+  }catch(e){                       // transient — keep polling
+    polling = false;
+    return setTimeout(poll, 700);
+  }
 
-    paused = !!s.paused;
-    $("pause").textContent = paused ? "▶ Resume" : "⏸ Pause";
-    // While paused the ETA is meaningless (and the clock is stopped anyway).
-    $("eta-text").textContent = paused ? "paused" : fmtEta(s.eta_s);
+  paused = !!s.paused;
+  const stopping = !!s.stopping;
+  const discovering = !!s.discovering;
 
-    if(s.current) $("live-sub").textContent = paused ? "paused — nothing in flight"
-                                                     : "processing " + s.current;
-    renderChips(s.counts);
-    renderFeed(s.recent);
-    if(paused) $("phase-label").textContent = "Paused";
-    else if(rs.phase === "linking") $("phase-label").textContent = "Linking to GSTR-2A…";
-    else if(rs.phase === "scanning") $("phase-label").textContent = "Scanning invoices…";
-    if(rs.phase === "stopped"){ finishStopped(rs, s); polling = false; return; }
-    if(rs.phase === "done"){ finishDone(rs); polling = false; return; }
-    if(rs.phase === "error"){ show("setup"); showErr(rs.error || "Run failed."); $("run").disabled = false; polling = false; return; }
-  }catch(e){ /* transient — keep polling */ }
+  // While the walker is still enumerating, the corpus size is unknown, so a
+  // percentage would be a lie — show the growing file count and a moving bar.
+  $("barwrap").classList.toggle("indet", discovering && !paused);
+  if(!discovering) $("bar").style.width = (s.pct||0) + "%";
+  $("progress-text").textContent = discovering
+    ? ((s.discovered||0).toLocaleString() + " PDFs found so far")
+    : ((s.done||0) + " / " + (s.total||0));
+  $("pct-text").textContent = discovering ? "" : ((s.pct||0) + "%");
+
+  $("pause").textContent = paused ? "▶ Resume" : "⏸ Pause";
+  $("live-spin").style.display = paused ? "none" : "inline-block";
+  $("eta-text").textContent = paused ? "paused" : fmtEta(s.eta_s);
+
+  $("phase-label").textContent =
+      paused                    ? "Paused"
+    : stopping                  ? "Stopping…"
+    : rs.phase === "linking"    ? "Linking to GSTR-2A…"
+    : rs.phase === "finishing"  ? "Finishing up — writing results…"
+    : discovering               ? "Finding PDFs…"
+                                : "Scanning invoices…";
+
+  $("live-sub").textContent =
+      paused      ? "Paused — nothing new will start until you resume."
+    : stopping    ? "Letting the work already in flight finish…"
+    : discovering ? "Walking the folder tree. Processing has already started on what it found."
+    : s.current   ? ("processing " + s.current)
+                  : "Starting…";
+
+  renderChips(s.counts);
+  renderFeed(s.recent);
+
+  if(rs.phase === "stopped"){ finishStopped(rs, s); polling = false; return; }
+  if(rs.phase === "done"){ finishDone(rs); polling = false; return; }
+  if(rs.phase === "error"){ show("setup"); showErr(rs.error || "Run failed."); $("run").disabled = false; polling = false; return; }
+
   polling = false;
   setTimeout(poll, 500);
 }
@@ -293,16 +330,28 @@ function finishDone(rs){
     ["PDFs", sm.total_pdfs], ["Invoices", sm.invoices], ["Flagged", sm.flagged],
     ["Via OCR", sm.ocr_docs], ["Avg confidence", sm.avg_invoice_confidence],
   ].map(([k,v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v==null?"–":v}</div></div>`).join("");
-  $("go-review").textContent = (sm.flagged||0) ? `Review ${sm.flagged} flagged →` : "Open review queue →";
-  if(rs.link){
-    const l = rs.link;
-    $("link-line").textContent = `GSTR-2A: linked ${l.matched}/${l.total} rows`
-      + (l.not_found ? `, ${l.not_found} not found` : "")
-      + (l.ambiguous ? `, ${l.ambiguous} ambiguous` : "") + ".";
+
+  // The link result is the headline, so lead with it — and lead with the GAP,
+  // because that is the only part a human has to act on.
+  const l = rs.link, line = $("link-line");
+  if(l){
+    const gap = (l.not_found||0) + (l.ambiguous||0);
+    line.style.display = "block";
+    line.className = "banner" + (gap ? " warn" : "");
+    line.innerHTML = gap
+      ? `<b>${l.matched} of ${l.total}</b> B2B rows matched an invoice PDF — `
+        + `<b>${l.not_found} found no PDF</b>${l.ambiguous ? `, ${l.ambiguous} are ambiguous` : ""}`
+        + `${l.unreferenced ? `, and ${l.unreferenced} detected invoice(s) match no row` : ""}.`
+      : `✓ All ${l.total} B2B rows matched an invoice PDF.`;
+    $("go-review").textContent = gap ? `Resolve ${gap} unmatched row(s) →` : "Open review →";
   } else if(rs.has_gstr){
-    $("link-line").textContent = "GSTR-2A linking runs after review — open the "
-      + "review queue and click “Finish & export” to write the linked workbook + invoice folder.";
+    line.style.display = "block";
+    line.className = "banner bad";
+    line.textContent = "The GSTR-2A workbook could not be matched — open review for details.";
+  } else {
+    $("go-review").textContent = (sm.flagged||0) ? `Review ${sm.flagged} flagged →` : "Open review →";
   }
+
   if(hasNative()){
     $("open-out").style.display = "inline-block";
     $("open-out").onclick = () => window.pywebview.api.open_output();
@@ -336,11 +385,31 @@ function finishDone(rs){
 }
 
 // ---- bootstrap from server-rendered state --------------------------------
+// Every bit of form state is rehydrated from run_state, so coming back from the
+// review queue no longer resets the source to Local, forgets that Drive is
+// connected, or strands a stopped run with no way to resume it.
 (function(){
   if(!hasNative()) $("type-hint").style.display = "inline";
+  setMode(INIT.source_mode || "local");
+  setDriveConnected(!!INIT.drive_signed_in);
+  const li = INIT.last_input;
+  if(li){
+    if(li.source_mode === "drive"){
+      $("drive-folder").value = li.invoice || "";
+      $("drive-gstr").value = li.gstr || "";
+      $("drive-out").value = li.upload_folder || "";
+    } else {
+      $("inv").value = li.invoice || "";
+      $("gstr").value = li.gstr || "";
+    }
+  }
   const p = INIT.phase;
-  if(p === "scanning" || p === "linking"){ show("live"); poll(); }
+  if(p === "scanning" || p === "linking" || p === "finishing"){ show("live"); poll(); }
   else if(p === "done"){ finishDone(INIT); }
+  // 'stopped' used to fall through to the setup screen, so stopping and then
+  // clicking any nav link made the resume screen unreachable. poll() fills in the
+  // real counts on its first (and only) tick.
+  else if(p === "stopped"){ show("stopped"); poll(); }
   else { show("setup"); if(p === "error" && INIT.error) showErr(INIT.error); }
 })();
 </script>

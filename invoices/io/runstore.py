@@ -64,6 +64,11 @@ class RunStore:
         return self.dir / "review_pdfs"
 
     @property
+    def link_path(self) -> Path:
+        """The GSTR-2A match plan — row->invoice, and the gaps on both sides."""
+        return self.dir / "link.json"
+
+    @property
     def linked_dir(self) -> Path:
         """Flat folder holding the invoices referenced by a linked GST return."""
         return self.dir / "linked_invoices"
@@ -83,6 +88,21 @@ class RunStore:
     def load(self) -> RunResult:
         data = json.loads(self.detections_path.read_text())
         return RunResult.model_validate(data)
+
+    # ---- GSTR-2A link plan -------------------------------------------------
+    def save_link(self, plan) -> Path:
+        self.link_path.write_text(json.dumps(plan.to_dict(), indent=2))
+        return self.link_path
+
+    def load_link(self):
+        """The saved match plan, or None. Import is local to avoid a cycle
+        (io.gstr imports RunStore)."""
+        from .gstr import LinkPlan
+
+        try:
+            return LinkPlan.from_dict(json.loads(self.link_path.read_text()))
+        except (OSError, json.JSONDecodeError, TypeError, KeyError):
+            return None
 
     # ---- resumable checkpoint ---------------------------------------------
     def append_checkpoint(self, doc: Document) -> None:
@@ -128,14 +148,44 @@ class RunStore:
         return ordered
 
     # ---- run metadata (for finding a resumable run) -----------------------
-    def write_meta(self, root: str, complete: bool) -> None:
-        self.meta_path.write_text(json.dumps({"root": root, "complete": complete}))
+    def write_meta(self, root: str, complete: bool, **extra) -> None:
+        """Merge, don't clobber: `run_scan` rewrites {root, complete} at the end of
+        every run, and that must not wipe the gstr path or the reviewer's manual
+        bindings stored alongside them."""
+        self.update_meta(root=root, complete=complete, **extra)
+
+    def update_meta(self, **fields) -> None:
+        meta = self.read_meta()
+        meta.update(fields)
+        self.meta_path.write_text(json.dumps(meta, indent=2))
 
     def read_meta(self) -> dict:
         try:
             return json.loads(self.meta_path.read_text())
         except (OSError, json.JSONDecodeError):
             return {}
+
+    # ---- the GSTR-2A workbook + the reviewer's manual row bindings ---------
+    # Both live in the meta so a run reopened later (`invoices review`) can still
+    # link — previously `serve()` never restored the gstr path, so "Finish &
+    # export" on a reopened run always refused to link.
+    def gstr_path(self) -> Optional[Path]:
+        p = self.read_meta().get("gstr_path")
+        return Path(p) if p else None
+
+    def manual_links(self) -> dict[int, str]:
+        raw = self.read_meta().get("manual_links") or {}
+        return {int(k): v for k, v in raw.items()}
+
+    def set_manual_link(self, row: int, doc_id: Optional[str]) -> dict[int, str]:
+        """Bind (or, with doc_id=None, unbind) a B2B row to an invoice."""
+        links = self.manual_links()
+        if doc_id:
+            links[row] = doc_id
+        else:
+            links.pop(row, None)
+        self.update_meta(manual_links={str(k): v for k, v in links.items()})
+        return links
 
     @classmethod
     def find_resumable(cls, out_root: Path, root: str) -> Optional["RunStore"]:

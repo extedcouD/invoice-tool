@@ -2,12 +2,46 @@
 {% block title %}{{ d.fields.invoice_id or d.id }} — review{% endblock %}
 {% block body %}
 <p><a href="{{ url_for('review') }}">← review queue</a></p>
+
+{% if locked %}
+<div class="banner warn">
+  The scan is still running — this document is read-only until it finishes, because
+  edits made now would be overwritten when the scan writes its final result.
+</div>
+{% endif %}
+
+{% if linked %}
+<div class="banner">✓ Saved — this invoice now matches <b>B2B row {{ linked }}</b> of the GSTR-2A return.</div>
+{% endif %}
+
 <h1>{{ d.fields.invoice_id or d.id }}
   <span class="pill {{ 'bad' if d.confidence<0.6 else 'warn' if d.confidence<0.8 else 'ok' }}">conf {{ '%.2f'|format(d.confidence) }}</span>
   <span class="pill {{ 'warn' if d.source.value=='ocr' else 'info' }}">{{ d.source.value }}</span>
   {% if d.reviewed %}<span class="pill ok">reviewed</span>{% endif %}
 </h1>
 <div class="muted mono" style="margin-bottom:8px">{{ d.path }}</div>
+
+{# The link verdict, stated plainly — it is the reason this tool exists. #}
+{% if state.has_gstr and d.is_invoice %}
+<div class="card" style="margin-bottom:14px">
+  {% if d.link_status.value == 'matched' %}
+    <span class="pill ok">matched</span>
+    Satisfies <b>B2B row {{ d.gstr_row }}</b>{% if row and row.manual %} (bound by hand){% endif %}.
+    Will be exported as <span class="mono">{{ d.gstr_ref }}</span>.
+  {% elif d.link_status.value == 'ambiguous' %}
+    <span class="pill warn">ambiguous</span>
+    This invoice is one of several candidates for a B2B row — the number matches but
+    the GSTINs conflict. Correct the GSTIN below, or pick a winner from the row.
+  {% elif d.link_status.value == 'unreferenced' %}
+    <span class="pill bad">no GSTR-2A row</span>
+    This invoice matches no row in the return. Usually the GSTIN or the invoice
+    number below was read wrong — fix it and save, and it will re-match instantly.
+    If it isn't an invoice at all, reject it.
+  {% else %}
+    <span class="pill info">not matched yet</span>
+  {% endif %}
+</div>
+{% endif %}
 
 {% if d.flags %}
 <div style="margin-bottom:14px">
@@ -28,7 +62,7 @@
 
   <!-- editable fields + trace -->
   <div class="col">
-    <h2>Fields <span class="muted">(edit &amp; confirm)</span></h2>
+    <h2>Fields <span class="muted">(edit &amp; confirm — saving re-runs the GSTR match)</span></h2>
     <form method="post" action="{{ url_for('confirm', doc_id=d.id) }}">
       <div class="grid" style="grid-template-columns:1fr 1fr;gap:10px">
         <div><label>invoice_id (filename)</label>
@@ -50,8 +84,16 @@
         <div><label>bill-to GSTIN</label>
           <input name="bill_to_gstin" value="{{ d.fields.bill_to_gstin or '' }}"></div>
       </div>
-      <div style="margin-top:12px"><button class="btn" type="submit">✓ Confirm &amp; save</button></div>
+      <div style="margin-top:12px"><button class="btn" type="submit" {{ 'disabled' if locked }}>✓ Confirm &amp; save</button></div>
     </form>
+
+    {% if d.is_invoice and not locked %}
+    <form method="post" action="{{ url_for('reject', doc_id=d.id) }}" style="margin-top:10px"
+          onsubmit="return confirm('Mark this as NOT an invoice? It will be dropped from the master workbook and from the GSTR match.')">
+      <button class="btn ghost" type="submit">✕ Not an invoice</button>
+      <span class="muted" style="margin-left:8px">Removes it from the master and the match.</span>
+    </form>
+    {% endif %}
 
     <h2>Pipeline trace <span class="muted">(why this result)</span></h2>
     <table>

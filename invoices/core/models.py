@@ -33,6 +33,19 @@ class Severity(str, Enum):
     ERROR = "error"
 
 
+class LinkStatus(str, Enum):
+    """Where an invoice stands against the GSTR-2A return.
+
+    ``UNREFERENCED`` is the reverse gap — a detected invoice that satisfies no
+    B2B row. It is the counterpart of a ``not_found`` row and, like it, is
+    something a human has to resolve.
+    """
+    UNKNOWN = "unknown"            # no GSTR-2A supplied, or not matched yet
+    MATCHED = "matched"
+    AMBIGUOUS = "ambiguous"        # this doc is one of several candidates for a row
+    UNREFERENCED = "unreferenced"  # detected invoice with no B2B row
+
+
 class Event(BaseModel):
     """One recorded decision/observation made by a stage about a document."""
     stage: str
@@ -107,6 +120,14 @@ class Document(BaseModel):
     review_pdf_path: Optional[str] = None     # copy placed in review folder, if flagged
     error: Optional[str] = None               # set if a stage hard-failed on this doc
 
+    # ---- GSTR-2A linking ---------------------------------------------------
+    # Stamped by `apply_plan` after every (re)match, so link state round-trips
+    # through detections.json and is visible in the review UI — the whole point
+    # of the tool is which invoice satisfies which B2B row.
+    link_status: LinkStatus = LinkStatus.UNKNOWN
+    gstr_row: Optional[int] = None            # the B2B row this invoice satisfies
+    gstr_ref: Optional[str] = None            # filename written into 'Invoice Ref'
+
     # ---- convenience -------------------------------------------------------
     @property
     def is_invoice(self) -> bool:
@@ -135,6 +156,10 @@ class RunResult(BaseModel):
     root: str
     started_at: str = ""            # ISO string, stamped by caller (no clock in models)
     finished_at: str = ""
+    # False when the user stopped the scan before the tree was exhausted. The one
+    # source of truth for "is this run resumable" — the UI's stopped screen and
+    # RunStore.find_resumable must never disagree about it.
+    complete: bool = True
     documents: list[Document] = Field(default_factory=list)
     stage_metrics: list[StageMetric] = Field(default_factory=list)
 

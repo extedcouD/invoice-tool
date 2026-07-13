@@ -41,9 +41,10 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from ..config import Settings, DEFAULTS
+from ..core.control import RunControl
 from ..core.interfaces import FileSource
 from ..core.models import Document
-from ..stages.walk import _bank_from, _parse_path
+from ..stages.walk import _bank_from, _parse_path, seed_document
 
 # drive.readonly (restricted) to read the user's existing tree; drive.file
 # (non-sensitive) to create + upload into the app's own output folder.
@@ -264,15 +265,22 @@ class DriveClient:
                 break
         return out
 
-    def walk_pdf_tree(self, root_id: str) -> Iterator[tuple[list[str], dict]]:
+    def walk_pdf_tree(self, root_id: str,
+                      control: "RunControl | None" = None
+                      ) -> Iterator[tuple[list[str], dict]]:
         """Depth-first yield of ``(folder_parts, file)`` for every PDF in the tree.
 
         ``folder_parts`` is the list of folder names from (but excluding) the
         root down to the file's parent — the same shape ``walk`` feeds to
         ``_parse_path``. Metadata only; no content is downloaded here.
+
+        ``control`` is checked once per folder listing — the finest granularity
+        available, since each listing is a blocking network round-trip.
         """
         stack: list[tuple[str, list[str]]] = [(root_id, [])]
         while stack:
+            if control is not None:
+                control.gate()
             folder_id, parts = stack.pop()
             for child in self.list_children(folder_id):
                 mime = child.get("mimeType")
@@ -404,44 +412,33 @@ class DriveFileSource(FileSource):
 
 
 def walk_drive(root_id: str, settings: Settings = DEFAULTS, *,
-               client: DriveClient) -> list[Document]:
+               client: DriveClient,
+               control: "RunControl | None" = None) -> Iterator[Document]:
     """Drive analogue of :func:`invoices.stages.walk.walk`.
 
-    Produces seed Documents for every in-scope (``Payments/<scope>``) PDF under
+    Yields seed Documents for every in-scope (``Payments/<scope>``) PDF under
     ``root_id``, reusing the local walk's tolerant path labelling and the same
     review flags, but keyed on the Drive file id.
-    """
-    from ..observability.events import record
 
-    docs: list[Document] = []
-    idx = 0
-    for folder_parts, f in client.walk_pdf_tree(root_id):
+    A generator, and gated: enumerating a large Drive tree is one paginated
+    network round-trip per folder and can run for minutes, during which Stop used
+    to do nothing at all.
+    """
+    for folder_parts, f in client.walk_pdf_tree(root_id, control=control):
         bank = _bank_from(folder_parts, settings.bank_scope)
         if not bank or bank.lower() != settings.bank_scope.lower():
             continue  # scope gate — never downloads out-of-scope content
 
         info = _parse_path(folder_parts)
         info.bank = info.bank or bank
-        display_path = "drive://" + "/".join(folder_parts + [f["name"]])
         modified = f.get("modifiedTime", "")
 
-        doc = Document(
-            id=f"d{idx:05d}",
-            path=display_path,
+        yield seed_document(
+            source_key=f"drive:{f['id']}@{modified}",
+            path="drive://" + "/".join(folder_parts + [f["name"]]),
             filename=f["name"],
             size_bytes=int(f.get("size") or 0),
-            source_key=f"drive:{f['id']}@{modified}",
+            info=info,
             drive_file_id=f["id"],
             drive_modified_time=modified,
-            path_info=info,
         )
-        record(doc, "walk", "discovered",
-               f"fy={info.fy} month={info.month} date={info.date_folder} "
-               f"company={info.company}", company=info.company, fy=info.fy)
-        if info.company is None:
-            doc.add_flag("no_company_folder", "could not derive company from path")
-        if not (info.fy and info.month and info.date_folder):
-            doc.add_flag("path_incomplete", "missing FY/month/date folder level")
-        docs.append(doc)
-        idx += 1
-    return docs

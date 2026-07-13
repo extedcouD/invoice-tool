@@ -13,6 +13,7 @@ import pytesseract
 from PIL import Image
 
 from ..config import Settings, DEFAULTS
+from ..core.control import RunControl
 from ..core.interfaces import FileSource, TextSource
 from ..core.models import Document
 from .sources import LocalFileSource
@@ -20,11 +21,16 @@ from .sources import LocalFileSource
 
 class PdfTextSource(TextSource):
     def __init__(self, settings: Settings = DEFAULTS,
-                 file_source: FileSource | None = None) -> None:
+                 file_source: FileSource | None = None,
+                 control: RunControl | None = None) -> None:
         self.s = settings
         # Where the PDF bytes come from. Local by default; a DriveFileSource
         # downloads to a temp file so the fitz.open below is unchanged.
         self.file_source = file_source or LocalFileSource()
+        # Extraction is by far the longest stage — one tesseract subprocess per
+        # scanned page — so it checks in per page rather than making the user wait
+        # out a whole 30-page document after clicking Stop.
+        self.control = control
 
     def _ocr_page(self, page: "fitz.Page") -> str:
         pix = page.get_pixmap(dpi=self.s.ocr_dpi)
@@ -43,6 +49,8 @@ class PdfTextSource(TextSource):
                     if len(txt.strip()) >= self.s.min_text_chars:
                         native_parts.append(txt)
                     elif self.s.ocr_enabled:
+                        if self.control is not None:
+                            self.control.gate()
                         native_parts.append(self._ocr_page(page))
                         used_ocr = True
                     else:
