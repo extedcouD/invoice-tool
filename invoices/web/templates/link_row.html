@@ -25,56 +25,262 @@
   {% endif %}
 </div>
 
-<h2>
-  {% if q %}Search results for “{{ q }}”
-  {% elif rm.status == 'ambiguous' %}Conflicting candidates <span class="muted">— these all carry this invoice number under different GSTINs</span>
-  {% else %}Closest detected invoices <span class="muted">— ranked by how nearly they match</span>{% endif %}
-</h2>
+<div class="tabs" id="picker-tabs">
+  <a href="#" data-mode="near" class="on">Closest matches <span class="n">{{ scored|length }}</span></a>
+  <a href="#" data-mode="search">Search by path or field</a>
+  <a href="#" data-mode="browse">Browse folders</a>
+</div>
+<div style="height:16px"></div>
 
-<form method="get" action="{{ url_for('link_row', row=rm.row) }}"
-      class="flex" style="gap:10px;align-items:center;margin-bottom:14px">
-  <div class="col"><input name="q" value="{{ q }}" autocomplete="off"
-       placeholder="Search all detected invoices by number, vendor, GSTIN or filename…"></div>
-  <button class="btn ghost" type="submit">Search</button>
-  {% if q %}<a class="btn ghost" href="{{ url_for('link_row', row=rm.row) }}">Clear</a>{% endif %}
-</form>
+{# ---- 1 · field-based near-misses (GSTIN + invoice number) ----------------- #}
+<div id="pane-near">
+  <p class="muted" style="margin-top:0">
+    {% if rm.status == 'ambiguous' %}These all carry this invoice number under different GSTINs — pick the right one.
+    {% else %}Ranked by how nearly their GSTIN and invoice number match this row.
+      If the answer isn't here, the PDF's GSTIN or number was probably misread —
+      <a href="#" data-goto="search">search by its folder path</a> or
+      <a href="#" data-goto="browse">browse to it</a> instead.{% endif %}
+  </p>
+  {% if not scored %}
+    <div class="card">
+      <span class="pill bad">nothing close</span>
+      No detected invoice resembles this row. Either the PDF was never filed, or it
+      wasn't detected as an invoice at all — the other two tabs search every PDF in
+      the tree, not just the detected invoices.
+    </div>
+  {% else %}
+  <table>
+    <tr><th>invoice id</th><th>folder</th><th>GSTIN</th><th>date</th>
+        <th>conf</th><th>match</th><th></th></tr>
+    {% for d, s in scored %}
+    <tr>
+      <td class="mono">{{ d.fields.invoice_id or d.filename }}</td>
+      <td class="muted">{{ d.path_info.company or '—' }}</td>
+      <td class="mono muted">{{ d.fields.vendor_gstin or '—' }}</td>
+      <td class="muted">{{ d.fields.invoice_date or '—' }}</td>
+      <td><span class="pill {{ 'bad' if d.confidence<0.6 else 'warn' if d.confidence<0.8 else 'ok' }}">{{ '%.2f'|format(d.confidence) }}</span></td>
+      <td>{% if s is not none %}
+        <span class="pill {{ 'ok' if s>=85 else 'warn' if s>=60 else 'info' }}">{{ s|round(0)|int }}%</span>
+      {% else %}<span class="muted">—</span>{% endif %}</td>
+      <td class="right" style="white-space:nowrap">
+        <a class="btn ghost sm" href="{{ url_for('doc_detail', doc_id=d.id) }}">Preview</a>
+        <form method="post" action="{{ url_for('bind_row', row=rm.row) }}" style="display:inline">
+          <input type="hidden" name="doc_id" value="{{ d.id }}">
+          <button class="btn sm" type="submit">Bind</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+</div>
 
-{% if not scored %}
-  <div class="card">
-    <span class="pill bad">nothing close</span>
-    No detected invoice resembles this row. Either the PDF was never filed, or it
-    wasn't detected as an invoice — try searching by filename above.
+{# ---- 2 · typo-tolerant search over the original paths --------------------- #}
+<div id="pane-search" hidden>
+  <div style="position:relative">
+    <input id="q" autocomplete="off" spellcheck="false" value="{{ q }}"
+           placeholder="Type a folder, month, company, filename or number — e.g. “apex aug 003”">
+    <div id="ac" class="ac" hidden></div>
   </div>
-{% else %}
-<table>
-  <tr><th>invoice id</th><th>vendor (PDF)</th><th>GSTIN</th><th>date</th>
-      <th>conf</th>{% if not q %}<th>match</th>{% endif %}<th></th></tr>
-  {% for d, s in scored %}
-  <tr>
-    <td class="mono">{{ d.fields.invoice_id or d.filename }}</td>
-    <td class="muted">{{ d.fields.vendor_name_pdf or '—' }}</td>
-    <td class="mono muted">{{ d.fields.vendor_gstin or '—' }}</td>
-    <td class="muted">{{ d.fields.invoice_date or '—' }}</td>
-    <td><span class="pill {{ 'bad' if d.confidence<0.6 else 'warn' if d.confidence<0.8 else 'ok' }}">{{ '%.2f'|format(d.confidence) }}</span></td>
-    {% if not q %}
-    <td>{% if s is not none %}
-      <span class="pill {{ 'ok' if s>=85 else 'warn' if s>=60 else 'info' }}">{{ s|round(0)|int }}%</span>
-    {% else %}<span class="muted">—</span>{% endif %}</td>
-    {% endif %}
-    <td class="right" style="white-space:nowrap">
-      <a class="btn ghost sm" href="{{ url_for('doc_detail', doc_id=d.id) }}">Preview</a>
-      <form method="post" action="{{ url_for('bind_row', row=rm.row) }}" style="display:inline">
-        <input type="hidden" name="doc_id" value="{{ d.id }}">
-        <button class="btn sm" type="submit">Bind to row {{ rm.row }}</button>
-      </form>
-    </td>
-  </tr>
-  {% endfor %}
-</table>
-<p class="muted" style="margin-top:12px">
-  Binding is remembered for this run and is honoured by the final export — the PDF
-  is copied into the flat folder and its name written into the row's
+  <p class="muted" style="margin-bottom:6px">
+    Searches the <b>full original path</b> of every PDF in the tree — company folder, month,
+    date folder and filename — as well as the parsed fields. Spelling is forgiven, so
+    “apx august” still finds <span class="mono">Apex…/Aug-2022/</span>.
+  </p>
+  <div id="search-results"></div>
+</div>
+
+{# ---- 3 · navigate the original folder tree -------------------------------- #}
+<div id="pane-browse" hidden>
+  {% if folder_hints %}
+  <div style="margin-bottom:12px">
+    <label>likely folders for “{{ rm.supplier }}”</label>
+    {% for f in folder_hints %}
+      <button class="btn ghost sm" type="button" data-jump="{{ f.path|join('/') }}">
+        📁 {{ f.name }} <span class="muted">{{ f.pdfs }} PDFs · {{ f.score|round(0)|int }}% name match</span>
+      </button>
+    {% endfor %}
+  </div>
+  {% endif %}
+  <div id="crumbs" class="crumbs"></div>
+  <div id="browse-results"></div>
+</div>
+
+<p class="muted" style="margin-top:14px">
+  Binding is remembered for this run and honoured by the final export — the PDF is
+  copied into the flat folder and its name written into the row's
   <span class="mono">Invoice Ref</span> cell.
 </p>
-{% endif %}
+
+<style>
+  .ac{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:8;background:var(--panel);
+      border:1px solid var(--line);border-radius:8px;max-height:320px;overflow:auto}
+  .ac .it{display:flex;gap:10px;align-items:center;padding:8px 12px;cursor:pointer;
+      border-bottom:1px solid var(--line)}
+  .ac .it:last-child{border-bottom:none}
+  .ac .it.on,.ac .it:hover{background:var(--panel2)}
+  .ac .it .p{flex:1;min-width:0}
+  .ac .it .f{font-family:var(--mono);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .ac .it .d{color:var(--mut);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .crumbs{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px;font-size:13px}
+  .crumbs a{color:var(--accent)} .crumbs span{color:var(--mut)}
+  .folder{cursor:pointer}
+</style>
+
+<script>
+(function(){
+  const BIND = "{{ url_for('bind_row', row=rm.row) }}";
+  const ROW  = {{ rm.row }};
+  const $ = s => document.querySelector(s);
+  const esc = s => (s == null ? "" : String(s)).replace(/[&<>"']/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+  // ---- tabs -------------------------------------------------------------
+  const PANES = {near:"#pane-near", search:"#pane-search", browse:"#pane-browse"};
+  function show(mode){
+    for(const [m, sel] of Object.entries(PANES)) $(sel).hidden = (m !== mode);
+    document.querySelectorAll("#picker-tabs a").forEach(a =>
+      a.classList.toggle("on", a.dataset.mode === mode));
+    if(mode === "search") $("#q").focus();
+    if(mode === "browse" && !browsed){ browsed = true; browse(START); }
+  }
+  document.querySelectorAll("#picker-tabs a").forEach(a =>
+    a.onclick = e => { e.preventDefault(); show(a.dataset.mode); });
+  document.querySelectorAll("[data-goto]").forEach(a =>
+    a.onclick = e => { e.preventDefault(); show(a.dataset.goto); });
+
+  // ---- one result row, shared by search + browse -------------------------
+  // A PDF the classifier didn't call an invoice is still bindable — that is very
+  // often exactly why this row went unmatched — but it must say so before you commit.
+  function rowHtml(h){
+    const conf = h.confidence < 0.6 ? "bad" : h.confidence < 0.8 ? "warn" : "ok";
+    const warn = h.is_invoice ? "" :
+      `<span class="pill warn" title="the scan classified this as '${esc(h.doc_type)}'. Binding it marks it an invoice.">not detected as an invoice</span>`;
+    const taken = (h.gstr_row && h.gstr_row !== ROW)
+      ? `<span class="pill info" title="already satisfies B2B row ${h.gstr_row}">row ${h.gstr_row}</span>` : "";
+    const score = h.score ? `<span class="pill ${h.score>=85?"ok":h.score>=70?"warn":"info"}">${Math.round(h.score)}%</span>` : "";
+    return `<tr>
+      <td class="mono">${esc(h.invoice_id || h.filename)}<div class="muted" style="font-size:11.5px">${esc(h.folder || "—")}</div></td>
+      <td class="mono muted">${esc(h.gstin || "—")}</td>
+      <td class="muted">${esc(h.vendor || h.company || "—")}</td>
+      <td><span class="pill ${conf}">${h.confidence.toFixed(2)}</span> ${warn} ${taken}</td>
+      <td>${score}</td>
+      <td class="right" style="white-space:nowrap">
+        <a class="btn ghost sm" href="/doc/${esc(h.id)}">Preview</a>
+        <form method="post" action="${BIND}" style="display:inline"
+              data-confirm="${h.is_invoice ? "" : esc(h.filename)}">
+          <input type="hidden" name="doc_id" value="${esc(h.id)}">
+          <button class="btn sm" type="submit">Bind</button>
+        </form>
+      </td></tr>`;
+  }
+  // Delegated, not an inline onsubmit: an apostrophe in a filename would be
+  // HTML-unescaped straight back into the middle of the handler's string literal.
+  document.addEventListener("submit", e => {
+    const name = e.target.dataset && e.target.dataset.confirm;
+    if(name && !confirm(
+        `${name} was not detected as an invoice. Bind it to B2B row ${ROW} and treat it as one?`))
+      e.preventDefault();
+  });
+  const table = hits => hits.length
+    ? `<table><tr><th>file / folder</th><th>GSTIN</th><th>vendor</th><th>status</th>
+         <th>match</th><th></th></tr>${hits.map(rowHtml).join("")}</table>`
+    : `<div class="card"><span class="pill info">nothing here</span> No PDF matches.</div>`;
+
+  // ---- search + autocomplete --------------------------------------------
+  const q = $("#q"), ac = $("#ac");
+  let hits = [], sel = -1, timer = null;
+
+  function drawAc(){
+    if(!hits.length){ ac.hidden = true; return; }
+    ac.innerHTML = hits.slice(0, 8).map((h, i) => `
+      <div class="it ${i === sel ? "on" : ""}" data-i="${i}">
+        <span class="dot ${h.is_invoice ? "ok" : "warn"}"></span>
+        <span class="p"><span class="f">${esc(h.filename)}</span>
+          <span class="d">${esc(h.folder || "—")}</span></span>
+        <span class="pill ${h.score>=85?"ok":h.score>=70?"warn":"info"}">${Math.round(h.score)}%</span>
+      </div>`).join("");
+    ac.hidden = false;
+    ac.querySelectorAll(".it").forEach(el =>
+      el.onclick = () => { sel = +el.dataset.i; pick(); });
+  }
+  // Picking a suggestion doesn't bind — it drops you into that PDF's folder, so you
+  // can see what else was filed beside it. The near-miss is usually a neighbour.
+  function pick(){
+    const h = hits[sel]; if(!h) return;
+    ac.hidden = true;
+    show("browse"); browsed = true;
+    browse(h.rel.slice(0, -1).join("/"), h.id);
+  }
+
+  // `typing` gates the dropdown: it is an autocomplete, so it belongs over the
+  // input while you type — not stamped over the results table on a page load that
+  // arrived with ?q= already filled in.
+  async function search(typing){
+    const s = q.value.trim();
+    if(!s){ hits = []; ac.hidden = true; $("#search-results").innerHTML = ""; return; }
+    let r;
+    try{ r = await fetch("/api/link/search?q=" + encodeURIComponent(s)).then(x => x.json()); }
+    catch(e){ return; }
+    if(q.value.trim() !== s) return;      // a newer keystroke already won
+    hits = r.hits; sel = -1;
+    if(typing) drawAc(); else ac.hidden = true;
+    $("#search-results").innerHTML = table(hits);
+  }
+  q.oninput = () => { clearTimeout(timer); timer = setTimeout(() => search(true), 140); };
+  q.onkeydown = e => {
+    if(ac.hidden) return;
+    if(e.key === "ArrowDown"){ e.preventDefault(); sel = Math.min(sel + 1, Math.min(hits.length, 8) - 1); drawAc(); }
+    else if(e.key === "ArrowUp"){ e.preventDefault(); sel = Math.max(sel - 1, -1); drawAc(); }
+    else if(e.key === "Enter" && sel >= 0){ e.preventDefault(); pick(); }
+    else if(e.key === "Escape"){ ac.hidden = true; }
+  };
+  document.addEventListener("click", e => {
+    if(!ac.contains(e.target) && e.target !== q) ac.hidden = true;
+  });
+
+  // ---- folder navigation -------------------------------------------------
+  const START = "{{ (folder_hints[0].path|join('/')) if folder_hints else '' }}";
+  let browsed = false;
+
+  async function browse(prefix, highlight){
+    let b;
+    try{ b = await fetch("/api/link/browse?prefix=" + encodeURIComponent(prefix || "")).then(x => x.json()); }
+    catch(e){ return; }
+
+    const crumbs = [`<a href="#" data-p="">📂 all folders</a>`].concat(
+      b.crumbs.map(c => `<span>/</span><a href="#" data-p="${esc(c.path.join("/"))}">${esc(c.name)}</a>`));
+    $("#crumbs").innerHTML = crumbs.join(" ");
+    $("#crumbs").querySelectorAll("a").forEach(a =>
+      a.onclick = e => { e.preventDefault(); browse(a.dataset.p); });
+
+    const folders = b.folders.map(f => `
+      <tr class="folder" data-p="${esc(f.path.join("/"))}">
+        <td>📁 ${esc(f.name)}</td>
+        <td class="muted" colspan="4">${f.pdfs} PDF${f.pdfs === 1 ? "" : "s"}${f.invoices ? ` · ${f.invoices} detected invoice${f.invoices === 1 ? "" : "s"}` : ""}</td>
+        <td class="right muted">open →</td></tr>`).join("");
+
+    $("#browse-results").innerHTML =
+      (!b.folders.length && !b.files.length)
+        ? `<div class="card"><span class="pill info">empty</span> No PDFs under this folder.</div>`
+        : `<table><tr><th>file / folder</th><th>GSTIN</th><th>vendor</th><th>status</th>
+             <th></th><th></th></tr>${folders}${b.files.map(rowHtml).join("")}</table>`;
+
+    $("#browse-results").querySelectorAll("tr.folder").forEach(tr =>
+      tr.onclick = () => browse(tr.dataset.p));
+    if(highlight){
+      const r = $("#browse-results").querySelector(`input[value="${highlight}"]`);
+      if(r) r.closest("tr").style.outline = "1px solid var(--accent)";
+    }
+  }
+  document.querySelectorAll("[data-jump]").forEach(b =>
+    b.onclick = () => { show("browse"); browsed = true; browse(b.dataset.jump); });
+
+  // ?q= / ?tab= pick the opening pane, so a reload after a bind comes back to the
+  // way you were looking for the file rather than dumping you on the near-misses.
+  const want = new URLSearchParams(location.search).get("tab");
+  if(q.value.trim()){ show("search"); search(false); }
+  else if(PANES[want]) show(want);
+})();
+</script>
 {% endblock %}

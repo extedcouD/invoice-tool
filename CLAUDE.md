@@ -103,6 +103,20 @@ Key structural facts (each requires reading several files to reconstruct):
   **Matching runs at the end of the scan; only the expensive write is deferred to
   "Finish & export".** Never compute a doc→row mapping and reduce it to a count — the two-sided
   gap (rows with no PDF, invoices with no row) *is* the product.
+- **A human resolving a row searches by *path*, because the fields are what failed**
+  (`matching/paths.py`). `match` keys on (GSTIN, invoice no), so a row reaching the "no PDF"
+  tab usually means one of those two was misread — offering only a field search there offers
+  the reviewer the very thing that already failed. `PathIndex` is a second way in, pure over
+  the run's Documents (no I/O, no scan): `search` is typo-tolerant over the full original
+  folder path *and* the fields, `browse` walks the original tree a level at a time, and
+  `suggest_folders` uses the B2B row's supplier name to open the browser at the right company
+  folder. It backs `/api/link/search` + `/api/link/browse`, and is cached per (run, doc count,
+  edit generation) in `web/app.py` because the search is a typeahead — it runs on every
+  keystroke over what may be 50k documents. Scoring is a **mean over the query's words** off an
+  inverted index, *not* `fuzz.WRatio` over the whole path: WRatio folds in
+  `partial_token_set_ratio`, which returns 100 as soon as any single word overlaps, and every
+  PDF in a tree shares words like "2022" — it scored an unrelated Zephyr invoice 85 for the
+  query "apex aug 003".
 - **`write_linked` pulls bytes through the `FileSource`.** On a Drive run `doc.path` is a
   display string, not a file — a plain `shutil.copy2(doc.path)` fails for every matched row.
 - **Scans are resumable, and `RunResult.complete` is the one fact that decides it.** Each
@@ -163,6 +177,10 @@ Key structural facts (each requires reading several files to reconstruct):
 - **Change how a B2B row is matched to a PDF** → `io/gstr.py::_resolve` / `_pick_best` (keys and
   tie-breaks) and `suggest` (the candidates offered when a human has to resolve a row by hand).
   `match` is pure, so `tests/test_linking.py` asserts outcomes directly — no scan needed.
+- **Change how a human *finds* a PDF for an unmatched row** → `matching/paths.py`: `TOKEN_SCORE`
+  (what counts as the same word despite a typo) and `SCORE_CUTOFF` (how much of the query a path
+  must answer), `_searchable` (what goes in the haystack), `browse`. Pure, so
+  `tests/test_paths.py` asserts ranking directly — no scan needed.
 - **New progress sink** (websocket, metrics, ...) → implement the `Reporter` interface in
   `observability/progress.py` and add it to the `MultiReporter` in `detect.py::run_scan`.
   Note `Reporter.discovered(n, complete)` — the corpus total is unknown until the walk ends.
@@ -185,3 +203,11 @@ Key structural facts (each requires reading several files to reconstruct):
   rows with no PDF" — the client's actual question. Low-confidence flags are the *third* tab.
   A human resolving a row (manual bind, or correcting a field) is the point of the whole app,
   so every such action re-runs `match` and reports what changed.
+- **A human may bind a row to a PDF the classifier did *not* call an invoice — and that
+  promotes it.** Search and browse deliberately range over every PDF in the tree, because a row
+  with no PDF very often points at one scored an approval or missed outright; hiding those hides
+  the answer. But `match` resolves `manual_links` against `result.invoices()` only, so binding a
+  non-invoice would otherwise be a silent no-op (and `write_linked` would write `NOT FOUND` over
+  it). `bind_row` therefore takes the human's pick as the assertion that it *is* an invoice:
+  it sets `doc_type=INVOICE` and records a `promoted` event saying a human, not the classifier,
+  decided that. The UI warns before the bind; don't make it bind silently.

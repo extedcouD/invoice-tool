@@ -28,6 +28,7 @@ from flask import (Flask, abort, jsonify, redirect, render_template, request,
 from ..core.models import DocType, RunResult
 from ..io.excel import write_master
 from ..io.runstore import RunStore
+from ..matching.paths import PathIndex
 from ..observability.events import record
 from .runner import RunController
 
@@ -68,6 +69,25 @@ def create_app(controller: RunController) -> Flask:
 
     def plan():
         return controller.plan
+
+    # `gen` is bumped by every edit; the key also carries the document count so a
+    # still-growing checkpoint reindexes on its own.
+    index_cache: dict = {"key": None, "index": None, "gen": 0}
+
+    def index():
+        """The path search/browse index over *every* PDF in the run.
+
+        Cached, because the search behind it is a typeahead: it runs on every
+        keystroke over what may be tens of thousands of documents.
+        """
+        r = result()
+        if r is None:
+            return None
+        key = (r.run_id, len(r.documents), index_cache["gen"])
+        if index_cache["key"] != key:
+            index_cache["index"] = PathIndex(r.documents, r.root)
+            index_cache["key"] = key
+        return index_cache["index"]
 
     # ---- pages -----------------------------------------------------------
     @app.route("/")
@@ -119,7 +139,14 @@ def create_app(controller: RunController) -> Flask:
 
     @app.route("/link/row/<int:row>")
     def link_row(row):
-        """Find a PDF for one unmatched B2B row: ranked suggestions + a search box."""
+        """Find a PDF for one unmatched B2B row.
+
+        Three ways in, because the reason a row is unmatched decides which one can
+        possibly work: the field-based near-misses (`suggest`), a typo-tolerant
+        search over the original folder paths, and a browser of the folder tree
+        itself. The latter two are the only ones that can reach a PDF whose GSTIN
+        or number was misread — i.e. most of this queue.
+        """
         from ..io.gstr import B2BRow, suggest
 
         r, p = result(), plan()
@@ -130,25 +157,17 @@ def create_app(controller: RunController) -> Flask:
             abort(404)
 
         invoices = r.invoices()
-        q = (request.args.get("q") or "").strip()
-        if q:
-            ql = q.lower()
-            cands = [d for d in invoices
-                     if ql in (d.fields.invoice_id or "").lower()
-                     or ql in (d.fields.invoice_no_content or "").lower()
-                     or ql in (d.fields.vendor_name_pdf or "").lower()
-                     or ql in (d.fields.vendor_gstin or "").lower()
-                     or ql in d.filename.lower()][:25]
-            scored = [(d, None) for d in cands]
-        else:
-            scored = suggest(B2BRow(row=rm.row, gstin=rm.gstin,
-                                    invoice_no=rm.invoice_no), invoices, limit=5)
+        scored = suggest(B2BRow(row=rm.row, gstin=rm.gstin,
+                                invoice_no=rm.invoice_no), invoices, limit=5)
         # An ambiguous row already has its candidates — show exactly those.
-        if rm.status == "ambiguous" and not q:
+        if rm.status == "ambiguous":
             by_id = {d.id: d for d in invoices}
             scored = [(by_id[i], None) for i in rm.candidates if i in by_id]
 
-        return render_template("link_row.html", rm=rm, scored=scored, q=q,
+        idx = index()
+        folders = idx.suggest_folders(rm.supplier) if idx else []
+        return render_template("link_row.html", rm=rm, scored=scored,
+                               folder_hints=folders, q=(request.args.get("q") or ""),
                                state=controller.run_state())
 
     # ---- data / actions --------------------------------------------------
@@ -209,6 +228,52 @@ def create_app(controller: RunController) -> Flask:
         r = result()
         return jsonify([json.loads(d.model_dump_json()) for d in r.documents] if r else [])
 
+    def _hit(h) -> dict:
+        """One candidate PDF, flattened for the picker UI.
+
+        `is_invoice` is carried through on purpose: a PDF the classifier didn't
+        call an invoice is still bindable (that is often *why* the row went
+        unmatched), but the UI has to say so before the reviewer commits.
+        """
+        d = h.doc
+        return {
+            "id": d.id, "filename": d.filename,
+            "folder": h.folder, "rel": h.rel, "score": h.score,
+            "invoice_id": d.fields.invoice_id, "gstin": d.fields.vendor_gstin,
+            "vendor": d.fields.vendor_name_pdf, "date": d.fields.invoice_date,
+            "company": d.path_info.company, "confidence": round(d.confidence, 2),
+            "is_invoice": d.is_invoice, "doc_type": d.doc_type.value,
+            "gstr_row": d.gstr_row,
+        }
+
+    @app.route("/api/link/search")
+    def api_link_search():
+        """Typo-tolerant search over the original folder paths *and* the fields.
+
+        This is the second way into a PDF. The matcher keys on (GSTIN, invoice no),
+        so when a row goes unmatched at least one of those is usually misread — and
+        searching by them again is searching by the thing that already failed. What
+        the reviewer still knows is where the file was filed.
+        """
+        idx = index()
+        if idx is None:
+            return jsonify({"hits": []})
+        q = (request.args.get("q") or "").strip()
+        return jsonify({"q": q, "hits": [_hit(h) for h in idx.search(q, limit=20)]})
+
+    @app.route("/api/link/browse")
+    def api_link_browse():
+        """One level of the original folder tree, for navigating to a PDF by hand."""
+        idx = index()
+        if idx is None:
+            return jsonify({"folders": [], "files": [], "crumbs": [], "prefix": []})
+        prefix = [p for p in (request.args.get("prefix") or "").split("/") if p]
+        b = idx.browse(prefix)
+        return jsonify({
+            "prefix": b["prefix"], "crumbs": b["crumbs"], "folders": b["folders"],
+            "files": [_hit(h) for h in b["files"]],
+        })
+
     @app.route("/pdf/<doc_id>")
     def pdf(doc_id):
         """Serve a document's PDF, fetching it on demand if it wasn't pre-copied.
@@ -241,6 +306,9 @@ def create_app(controller: RunController) -> Flask:
     def _persist(r) -> None:
         controller.store.save(r)
         write_master(r, controller.store.master_path())
+        # An edit can change a vendor name or promote a doc to an invoice, both of
+        # which the path index has baked in — drop it rather than serve stale hits.
+        index_cache["gen"] += 1
 
     def _locked() -> bool:
         """Review is read-only while a scan is running.
@@ -317,11 +385,31 @@ def create_app(controller: RunController) -> Flask:
 
     @app.route("/link/row/<int:row>/bind", methods=["POST"])
     def bind_row(row):
-        """Bind a B2B row to a detected invoice by hand (or unbind it)."""
+        """Bind a B2B row to a PDF by hand (or, with no doc_id, unbind it).
+
+        The PDF need not be a *detected* invoice. Searching and browsing reach
+        every PDF in the tree, and the whole reason a row lands here is often that
+        its invoice was scored an approval or missed — so refusing to bind those
+        would send the reviewer to the one place the answer isn't. `match()` and
+        `write_linked` resolve bindings against `result.invoices()` only, so a
+        human picking a non-invoice is taken as the assertion that it *is* one:
+        promote it, and record that a human — not the classifier — said so.
+        """
         doc_id = (request.form.get("doc_id") or "").strip() or None
         if _locked():
             return redirect(url_for("review", tab="rows", locked=1))
         with lock:
+            d = doc_by_id(doc_id) if doc_id else None
+            if doc_id and d is None:
+                abort(404)
+            if d is not None and not d.is_invoice:
+                was = d.doc_type.value
+                d.doc_type = DocType.INVOICE
+                d.reviewed = True
+                record(d, "review", "promoted",
+                       f"human bound this to B2B row {row}; was classified "
+                       f"'{was}', now treated as an invoice",
+                       severity="warn", row=row, was=was)
             controller.store.set_manual_link(row, doc_id)
             controller.rematch()
             _persist(result())
