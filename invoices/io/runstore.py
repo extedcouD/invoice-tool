@@ -5,7 +5,7 @@ Layout:
   out/run_<ts>/
     detections.json   # full RunResult (documents + events + metrics), at end
     checkpoint.jsonl  # one finished Document per line, appended live (resume ledger)
-    run_meta.json     # {root, complete} — lets an interrupted run be found + resumed
+    run_meta.json     # {root, fy, complete} — lets an interrupted run be found + resumed
     status.json       # live progress snapshot (written during scan)
     review_pdfs/      # copies of flagged PDFs for the review UI
     master_<ts>.xlsx  # exported workbook
@@ -19,6 +19,7 @@ already in the checkpoint (keyed by :attr:`Document.source_key`) and the final
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
@@ -34,8 +35,18 @@ class RunStore:
 
     # ---- factory -----------------------------------------------------------
     @classmethod
-    def new(cls, out_root: Path, run_id: str | None = None) -> "RunStore":
+    def new(cls, out_root: Path, run_id: str | None = None,
+            label: str | None = None) -> "RunStore":
+        """``label`` (the scanned FY, when the run is scoped to one year) is appended
+        to the run id, so the several per-year runs over one tree are tellable apart
+        on disk. The timestamp still leads, so a lexical sort of ``run_*`` is still
+        chronological — which ``_latest_run`` and ``find_resumable`` both rely on.
+        """
         run_id = run_id or datetime.now().strftime("%Y%m%d-%H%M%S")
+        if label:
+            slug = re.sub(r"[^A-Za-z0-9]+", "-", label).strip("-")   # FY 22-23 -> FY-22-23
+            if slug:
+                run_id = f"{run_id}_{slug}"
         return cls(Path(out_root) / f"run_{run_id}")
 
     @property
@@ -187,17 +198,37 @@ class RunStore:
         self.update_meta(manual_links={str(k): v for k, v in links.items()})
         return links
 
+    def fy(self) -> Optional[str]:
+        """The financial year this run was scoped to, or None if it scanned all years."""
+        return self.read_meta().get("fy")
+
     @classmethod
-    def find_resumable(cls, out_root: Path, root: str) -> Optional["RunStore"]:
-        """Newest incomplete run under ``out_root`` for the same input ``root``
-        (has a checkpoint, meta.complete is False), or None."""
+    def find_resumable(cls, out_root: Path, root: str,
+                       fy: str | None = None) -> Optional["RunStore"]:
+        """Newest incomplete run under ``out_root`` for the same input (has a
+        checkpoint, meta.complete is False), or None.
+
+        The input is **(root, fy)**, not root alone. A year-scoped run and an
+        all-years run over the same tree share a ``root``, so matching on root alone
+        would let a fresh "FY 23-24" run reopen an interrupted "FY 22-23" checkpoint
+        — and ``checkpoint_docs()`` would then assemble one detections.json spanning
+        two years.
+
+        The year is a *separate* meta key rather than a suffix on ``root``, because
+        ``root`` is also what every path is made relative to (``io/excel._rel``,
+        ``PathIndex``) and so has to stay a real path.
+
+        Runs written before this key existed have no "fy", so they read as None and
+        still resume an unscoped run.
+        """
         runs = sorted(Path(out_root).glob("run_*"))
         for run_dir in reversed(runs):
             try:
                 meta = json.loads((run_dir / "run_meta.json").read_text())
             except (OSError, json.JSONDecodeError):
                 continue
-            if meta.get("root") == root and not meta.get("complete") \
+            if meta.get("root") == root and meta.get("fy") == fy \
+                    and not meta.get("complete") \
                     and (run_dir / "checkpoint.jsonl").exists():
                 return cls(run_dir)
         return None

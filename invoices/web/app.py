@@ -186,14 +186,41 @@ def create_app(controller: RunController) -> Flask:
         gstr = (data.get("gstr") or "").strip() or None
         source_mode = (data.get("source_mode") or "local").strip()
         upload_folder = (data.get("upload_folder") or "").strip() or None
+        fy = (data.get("fy") or "").strip() or None     # "" = All years
         if not invoice:
             where = ("Google Drive folder" if source_mode == "drive"
                      else "invoice folder")
             return jsonify({"ok": False, "error": f"Choose the {where} first."}), 400
         partial_cache["size"] = -1          # a new run invalidates the cached ledger
         res = controller.start(invoice, gstr, source_mode=source_mode,
-                               upload_folder_name=upload_folder)
+                               upload_folder_name=upload_folder, fy=fy)
         return jsonify(res), (200 if res.get("ok") else 400)
+
+    @app.route("/api/years")
+    def api_years():
+        """The FY folders under a root — the year picker's options.
+
+        The client's returns arrive one workbook per financial year, so a run is
+        scoped to one year; "All years" ("") still walks the whole tree. Only the
+        server can see the tree — local *or* Drive — so the list comes from here.
+        """
+        root = (request.args.get("root") or "").strip()
+        mode = (request.args.get("source_mode") or "local").strip()
+        if not root:
+            return jsonify({"ok": True, "years": []})
+        if mode == "drive":
+            if controller.drive is None:
+                return jsonify({"ok": False, "years": [],
+                                "error": "Connect Google Drive first."}), 400
+            from ..io.drive import folder_id_from
+            try:
+                years = controller.drive.list_fy_folders(folder_id_from(root))
+            except Exception as exc:
+                return jsonify({"ok": False, "years": [], "error": str(exc)}), 400
+            return jsonify({"ok": True, "years": years})
+        from ..stages.walk import list_fy_folders
+        return jsonify({"ok": True,
+                        "years": list_fy_folders(Path(root).expanduser())})
 
     @app.route("/api/pause", methods=["POST"])
     def api_pause():
@@ -470,6 +497,15 @@ def serve(store: RunStore, port: int = 5000, open_browser: bool = True) -> None:
     # not link at all — "Finish & export" always claimed no workbook was chosen.
     controller.gstr_path = store.gstr_path()
     controller.plan = store.load_link()
+    # Restore the year this run was scoped to, and the inputs the setup screen (and
+    # the Resume button) rehydrate from. Without the year, resuming a reopened
+    # one-year run would post no scope and rescan the whole tree from zero.
+    meta = store.read_meta()
+    controller.fy = store.fy()
+    controller.last_input = {
+        "invoice": meta.get("root", ""), "gstr": str(controller.gstr_path or ""),
+        "source_mode": "local", "upload_folder": "", "fy": controller.fy or "",
+    }
 
     app = create_app(controller)
     url = f"http://127.0.0.1:{port}/"

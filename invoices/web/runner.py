@@ -59,6 +59,8 @@ class RunController:
         self.resumed: bool = False         # this run reopened an interrupted one
         self.upload_folder_name: Optional[str] = None
         self.upload_report: Optional[dict] = None
+        # The financial year this run is scoped to (None = every year under the root).
+        self.fy: Optional[str] = None
         # The inputs of the last start, so "Resume" survives a page reload (it used
         # to live in a page-scoped JS variable and vanish on any navigation).
         self.last_input: Optional[dict] = None
@@ -81,7 +83,8 @@ class RunController:
 
     def start(self, invoice_root: str | Path, gstr_path: str | Path | None,
               source_mode: str = "local",
-              upload_folder_name: str | None = None) -> dict:
+              upload_folder_name: str | None = None,
+              fy: str | None = None) -> dict:
         """Validate inputs and kick off scan on a background thread.
 
         ``source_mode`` is "local" (a filesystem folder) or "drive" (a Google
@@ -94,6 +97,7 @@ class RunController:
 
         source_mode = source_mode or "local"
         upload_name = (upload_folder_name or "").strip() or None
+        fy = (fy or "").strip() or None      # "" (All years) means no scope
 
         # Resolve the inputs *outside* the lock: on a Drive run this downloads the
         # GSTR workbook, and holding the lock across a network fetch stalled every
@@ -140,9 +144,15 @@ class RunController:
             self.source_mode = source_mode
             self.upload_folder_name = upload_name
             self.file_source = file_source
-            # Resume an interrupted run for the same input, else mint a fresh one.
-            existing = RunStore.find_resumable(self.output_root, root_key)
-            self.store = existing or RunStore.new(self.output_root)
+            self.fy = fy
+            # A per-run copy — never mutate self.settings: the controller outlives the
+            # run and the next one may pick a different year (or none).
+            run_settings = replace(self.settings, fy_scope=fy)
+            # Resume an interrupted run for the same input, else mint a fresh one. The
+            # input is (root, fy): an all-years run and a one-year run over the same
+            # tree are different corpora and must never resume each other.
+            existing = RunStore.find_resumable(self.output_root, root_key, fy=fy)
+            self.store = existing or RunStore.new(self.output_root, label=fy)
             self.resumed = existing is not None
             self.result = None
             self.plan = None
@@ -155,9 +165,14 @@ class RunController:
             self.last_input = {
                 "invoice": str(invoice_root), "gstr": str(gstr_path or ""),
                 "source_mode": source_mode, "upload_folder": upload_name or "",
+                # Load-bearing: the Resume button POSTs last_input verbatim. Drop the
+                # year here and resuming a stopped one-year run would start a fresh
+                # *unscoped* run that rescans the whole tree from zero.
+                "fy": fy or "",
             }
             self._thread = threading.Thread(
-                target=self._run, args=(root, root_key, file_source, walker),
+                target=self._run,
+                args=(root, root_key, file_source, walker, run_settings),
                 daemon=True)
             self._thread.start()
             return {"ok": True, "run_id": self.store.run_id, "resumed": self.resumed}
@@ -191,9 +206,9 @@ class RunController:
         with self._lock:
             self.phase = name
 
-    def _run(self, root, root_key, file_source, walker) -> None:
+    def _run(self, root, root_key, file_source, walker, settings) -> None:
         try:
-            store, result = run_scan(root, self.output_root, self.settings,
+            store, result = run_scan(root, self.output_root, settings,
                                      quiet=True, store=self.store,
                                      file_source=file_source, walker=walker,
                                      root_key=root_key, control=self.control,
@@ -321,6 +336,7 @@ class RunController:
                 "output_dir": str(self.store.dir) if self.store else None,
                 "has_gstr": self.gstr_path is not None,
                 "source_mode": self.source_mode,
+                "fy": self.fy,
                 "drive_signed_in": self.drive is not None,
                 "resumed": self.resumed,
                 "last_input": self.last_input,
