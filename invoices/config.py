@@ -131,6 +131,12 @@ MASTER_COLUMNS = [
 class Settings:
     """Runtime-overridable knobs (CLI can override a few of these)."""
     bank_scope: str = BANK_SCOPE
+    # One financial year per run: the FY folder name ("FY 22-23"), or None for every
+    # year under the root. It lives here, beside bank_scope (the other per-run scope
+    # filter), because run_scan hands Settings to a fixed-shape
+    # `walker(root, settings, control=)` — it is the only channel that reaches BOTH
+    # walk() and walk_drive().
+    fy_scope: str | None = None
     min_text_chars: int = MIN_TEXT_CHARS
     ocr_dpi: int = OCR_DPI
     ocr_lang: str = OCR_LANG

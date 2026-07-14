@@ -24,7 +24,10 @@
         <button class="btn ghost" id="inv-browse" type="button">Browse…</button>
       </div>
       <div style="height:14px"></div>
-      <label>2 · GSTR-2A workbook <span class="muted">(optional — leave blank to only detect &amp; extract)</span></label>
+      <label>2 · Financial year <span class="muted">(one GSTR-2A workbook covers one year — scan just that year)</span></label>
+      <select id="fy"><option value="">All years</option></select>
+      <div style="height:14px"></div>
+      <label>3 · GSTR-2A workbook <span class="muted">(optional — leave blank to only detect &amp; extract)</span></label>
       <div class="flex" style="gap:10px;align-items:center">
         <div class="col"><input id="gstr" placeholder="/path/to/GSTR2A_Return.xlsx" autocomplete="off"></div>
         <button class="btn ghost" id="gstr-browse" type="button">Browse…</button>
@@ -43,10 +46,13 @@
         <label>1 · Invoice folder on Drive <span class="muted">(paste the folder link or id)</span></label>
         <input id="drive-folder" placeholder="https://drive.google.com/drive/folders/…  or  <folderId>" autocomplete="off">
         <div style="height:14px"></div>
-        <label>2 · GSTR-2A workbook on Drive <span class="muted">(optional — paste the file link; an .xlsx or a Google Sheet both work)</span></label>
+        <label>2 · Financial year <span class="muted">(one GSTR-2A workbook covers one year — scan just that year)</span></label>
+        <select id="drive-fy"><option value="">All years</option></select>
+        <div style="height:14px"></div>
+        <label>3 · GSTR-2A workbook on Drive <span class="muted">(optional — paste the file link; an .xlsx or a Google Sheet both work)</span></label>
         <input id="drive-gstr" placeholder="https://drive.google.com/file/d/…/view  or  <fileId>" autocomplete="off">
         <div style="height:14px"></div>
-        <label>3 · Output folder name <span class="muted">(a new folder created in your Drive)</span></label>
+        <label>4 · Output folder name <span class="muted">(a new folder created in your Drive)</span></label>
         <input id="drive-out" placeholder="InvoiceLinker results" autocomplete="off">
       </div>
     </div>
@@ -143,8 +149,8 @@ function setDriveConnected(on){
   $("drive-connect").style.display = on ? "none" : "block";
   $("drive-connected").style.display = on ? "block" : "none";
 }
-$("src-local").onclick = () => setMode("local");
-$("src-drive").onclick = () => setMode("drive");
+$("src-local").onclick = () => { setMode("local"); loadYears(); };
+$("src-drive").onclick = () => { setMode("drive"); loadYears(); };
 
 $("drive-auth").onclick = async () => {
   $("err").style.display = "none";
@@ -153,14 +159,43 @@ $("drive-auth").onclick = async () => {
     const r = await fetch("/api/drive/auth", {method:"POST"});
     const j = await r.json();
     if(!j.ok){ showErr(j.error || "Could not connect to Google Drive."); }
-    else setDriveConnected(true);
+    else { setDriveConnected(true); loadYears(); }   // years need an authed client
   }catch(e){ showErr(String(e)); }
   $("drive-auth").disabled = false; $("drive-auth").textContent = "🔗 Connect Google Drive";
 };
 
+// ---- financial year -------------------------------------------------------
+// One GSTR-2A workbook covers one year, so a run is scoped to one FY folder and
+// the other years are never walked. "" = All years (the default — nothing breaks
+// if you don't pick one). Only the server can see the tree, local OR Drive, so the
+// options come from /api/years rather than being guessed here.
+const fySel   = () => sourceMode === "drive" ? $("drive-fy")     : $("fy");
+const rootBox = () => sourceMode === "drive" ? $("drive-folder") : $("inv");
+
+async function loadYears(keep){
+  const sel = fySel(), root = rootBox().value.trim();
+  const want = (keep != null) ? keep : sel.value;
+  sel.innerHTML = '<option value="">All years</option>';
+  if(!root) return;
+  try{
+    const r = await fetch("/api/years?source_mode=" + encodeURIComponent(sourceMode)
+                          + "&root=" + encodeURIComponent(root));
+    const j = await r.json();
+    for(const y of (j.years || [])){
+      const o = document.createElement("option");
+      o.value = y; o.textContent = y; o.selected = (y === want);
+      sel.appendChild(o);
+    }
+  }catch(e){ /* leave it on "All years" — the scan still works */ }
+}
+let yearsTimer;
+const scheduleYears = () => { clearTimeout(yearsTimer); yearsTimer = setTimeout(() => loadYears(), 400); };
+$("inv").addEventListener("input", scheduleYears);
+$("drive-folder").addEventListener("input", scheduleYears);
+
 // ---- native file dialogs (pywebview) or typed paths (browser fallback) ----
 $("inv-browse").onclick = async () => {
-  if(hasNative()){ const p = await window.pywebview.api.pick_folder(); if(p) $("inv").value = p; }
+  if(hasNative()){ const p = await window.pywebview.api.pick_folder(); if(p){ $("inv").value = p; loadYears(); } }
   else $("inv").focus();
 };
 $("gstr-browse").onclick = async () => {
@@ -175,11 +210,11 @@ function currentPayload(){
     const folder = $("drive-folder").value.trim();
     if(!folder){ showErr("Paste the Google Drive folder link or id."); return null; }
     return {source_mode:"drive", invoice: folder, gstr: $("drive-gstr").value.trim(),
-            upload_folder: $("drive-out").value.trim()};
+            upload_folder: $("drive-out").value.trim(), fy: $("drive-fy").value};
   }
   const invoice = $("inv").value.trim();
   if(!invoice){ showErr("Choose the invoice folder first."); return null; }
-  return {source_mode:"local", invoice, gstr: $("gstr").value.trim()};
+  return {source_mode:"local", invoice, gstr: $("gstr").value.trim(), fy: $("fy").value};
 }
 
 async function startRun(payload, btn){
@@ -402,6 +437,12 @@ function finishDone(rs){
       $("inv").value = li.invoice || "";
       $("gstr").value = li.gstr || "";
     }
+    // Repopulate the year picker and re-select the year of the last run. The setup
+    // card is display:none until this block runs, so a field not restored here is
+    // silently lost on every return trip from /review — and for the year that is
+    // not cosmetic: Resume POSTs last_input verbatim, so a dropped year would
+    // restart a one-year run as an unscoped rescan of the whole tree.
+    loadYears(li.fy || "");
   }
   const p = INIT.phase;
   if(p === "scanning" || p === "linking" || p === "finishing"){ show("live"); poll(); }

@@ -112,11 +112,12 @@ class WebviewApi:
 # --------------------------------------------------------------------------- #
 # Headless CLI (frozen-bundle smoke test / automation)
 # --------------------------------------------------------------------------- #
-def _run_pipeline(invoice_root: Path, gstr_path: Path):
+def _run_pipeline(invoice_root: Path, gstr_path: Path, fy: str | None = None):
     """Blocking scan + match + write the linked workbook. Returns (store, report).
 
     The headless path has no reviewer, so it does in one shot what the UI splits
     across review: `run_scan(gstr_path=...)` matches, and `write_linked` exports.
+    ``fy`` scopes the scan to one financial-year folder (None = every year).
     """
     from dataclasses import replace
 
@@ -124,7 +125,7 @@ def _run_pipeline(invoice_root: Path, gstr_path: Path):
     from .detect import run_scan
     from .io.gstr import write_linked
 
-    settings = replace(DEFAULTS, workers=4)
+    settings = replace(DEFAULTS, workers=4, fy_scope=fy)
     store, result = run_scan(invoice_root, OUTPUT_ROOT, settings, quiet=True,
                              gstr_path=gstr_path)
     plan = store.load_link()
@@ -140,15 +141,18 @@ def _run_pipeline(invoice_root: Path, gstr_path: Path):
 
 
 def _run_cli(argv: list[str]) -> int:
-    """Headless mode:  run_gui --cli <invoice_folder> <gstr.xlsx>
+    """Headless mode:  run_gui --cli <invoice_folder> <gstr.xlsx> [<FY xx-yy>]
 
     Same pipeline as the window, no display needed. Used to smoke-test the frozen
-    bundle (incl. bundled tesseract) and handy for power users / automation.
+    bundle (incl. bundled tesseract) and handy for power users / automation. The
+    optional third arg scopes the scan to one financial year, since one GSTR-2A
+    workbook covers one year.
     """
     if len(argv) < 2:
-        print("usage: --cli <invoice_folder> <gstr.xlsx>")
+        print("usage: --cli <invoice_folder> <gstr.xlsx> [<FY xx-yy>]")
         return 2
-    store, report = _run_pipeline(Path(argv[0]), Path(argv[1]))
+    fy = argv[2] if len(argv) > 2 else None
+    store, report = _run_pipeline(Path(argv[0]), Path(argv[1]), fy=fy)
     print(f"linked {report.matched}/{report.total} B2B rows "
           f"({report.not_found} not found); output: {store.dir}")
     return 0
@@ -201,12 +205,18 @@ def main() -> None:
     _wait_until_up(url)
 
     # Prefer a native window; fall back to the browser if no webview runtime.
+    #
+    # The fallback must cover `webview.start()`, not just the import: pywebview's
+    # only Windows backend is WinForms, which loads the .NET CLR through pythonnet
+    # *at start time*. On a locked-down or older Windows box that load fails
+    # ("Failed to resolve Python.Runtime.Loader.Initialize") long after `import
+    # webview` succeeded — and it used to take the whole app down with it. The web
+    # UI is the same either way; only the native folder-picker is lost, and the
+    # page already falls back to typed paths (Drive mode needs no dialogs at all).
     if "--web" not in argv:
         try:
             import webview
-        except Exception:
-            webview = None
-        if webview is not None:
+
             api = WebviewApi(controller)
             window = webview.create_window(
                 "Invoice → GSTR Linker", url, js_api=api,
@@ -215,6 +225,9 @@ def main() -> None:
             api.window = window
             webview.start()
             return
+        except Exception as exc:
+            print(f"native window unavailable ({type(exc).__name__}: {exc})\n"
+                  "falling back to your web browser.")
 
     # Browser fallback — keep the process (and Flask thread) alive.
     import webbrowser

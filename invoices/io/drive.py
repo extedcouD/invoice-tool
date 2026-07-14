@@ -38,13 +38,13 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 
-from ..config import Settings, DEFAULTS
+from ..config import RE_FY, Settings, DEFAULTS
 from ..core.control import RunControl
 from ..core.interfaces import FileSource
 from ..core.models import Document
-from ..stages.walk import _bank_from, _parse_path, seed_document
+from ..stages.walk import _bank_from, _parse_path, keep_fy_dir, seed_document
 
 # drive.readonly (restricted) to read the user's existing tree; drive.file
 # (non-sensitive) to create + upload into the app's own output folder.
@@ -265,8 +265,15 @@ class DriveClient:
                 break
         return out
 
+    def list_fy_folders(self, root_id: str) -> list[str]:
+        """FY folder names directly under ``root_id`` — the year picker's options."""
+        return sorted(c["name"] for c in self.list_children(root_id)
+                      if c.get("mimeType") == FOLDER_MIME
+                      and RE_FY.match(c.get("name", "")))
+
     def walk_pdf_tree(self, root_id: str,
-                      control: "RunControl | None" = None
+                      control: "RunControl | None" = None,
+                      descend: Optional[Callable[[list[str]], bool]] = None
                       ) -> Iterator[tuple[list[str], dict]]:
         """Depth-first yield of ``(folder_parts, file)`` for every PDF in the tree.
 
@@ -276,6 +283,13 @@ class DriveClient:
 
         ``control`` is checked once per folder listing — the finest granularity
         available, since each listing is a blocking network round-trip.
+
+        ``descend`` (optional) is asked about each child folder *before* it is
+        pushed, and receives that folder's OWN parts (``parts + [name]`` — inside
+        this loop ``parts`` is still the parent's). It is what makes a year-scoped
+        run cheap: the scope gate in ``walk_drive`` runs *after* the listing, so on
+        its own it only prevents downloads — without this we would still pay one
+        paginated files.list round-trip for every folder of every other year.
         """
         stack: list[tuple[str, list[str]]] = [(root_id, [])]
         while stack:
@@ -286,7 +300,9 @@ class DriveClient:
                 mime = child.get("mimeType")
                 name = child.get("name", "")
                 if mime == FOLDER_MIME:
-                    stack.append((child["id"], parts + [name]))
+                    child_parts = parts + [name]
+                    if descend is None or descend(child_parts):
+                        stack.append((child["id"], child_parts))
                 elif mime == PDF_MIME or name.lower().endswith(".pdf"):
                     yield parts, child
 
@@ -424,7 +440,18 @@ def walk_drive(root_id: str, settings: Settings = DEFAULTS, *,
     network round-trip per folder and can run for minutes, during which Stop used
     to do nothing at all.
     """
-    for folder_parts, f in client.walk_pdf_tree(root_id, control=control):
+    # One financial year per run — prune the TRAVERSAL, not just the yield, or we
+    # still network-list every folder of every other year (minutes, on a 120 GB
+    # tree, for nothing). root_id stays the TREE root, so the FY folder is still in
+    # folder_parts and _parse_path still sets info.fy — re-rooting at the FY
+    # folder's own id would drop it and flag every doc `path_incomplete`.
+    descend = None
+    if settings.fy_scope:
+        def descend(parts: list[str]) -> bool:
+            return keep_fy_dir(parts[-1], settings.fy_scope)
+
+    for folder_parts, f in client.walk_pdf_tree(root_id, control=control,
+                                                descend=descend):
         bank = _bank_from(folder_parts, settings.bank_scope)
         if not bank or bank.lower() != settings.bank_scope.lower():
             continue  # scope gate — never downloads out-of-scope content

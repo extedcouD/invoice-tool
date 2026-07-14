@@ -28,6 +28,13 @@ python -m invoices scan --root "Testing Environment" --workers 8
 # just the detection, no UI:
 python -m invoices scan --root "Testing Environment" --no-serve --workers 8
 
+# One GSTR-2A workbook covers one financial year, so scope the run to that year and
+# run the tool once per year. Each year gets its own run dir, master and linked xlsx;
+# the other years' folders are never walked. Omit --fy to scan every year, as before.
+python -m invoices years --root "Testing Environment"        # FY 22-23, FY 23-24, ...
+python -m invoices scan  --root "Testing Environment" --fy "FY 22-23" \
+    --gstr GSTR2A_FY22-23.xlsx --workers 8
+
 # 2. reopen the review app for a run (default: latest under ./out)
 python -m invoices review
 

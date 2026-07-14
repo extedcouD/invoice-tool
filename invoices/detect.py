@@ -160,11 +160,13 @@ def run_scan(root, out_root: Path, settings: Settings = DEFAULTS,
     walker = walker or walk
     # A caller (e.g. the desktop RunController) may pre-create/reopen the run dir
     # so it can poll status.json from t=0; otherwise mint a fresh one here.
-    store = store or RunStore.new(out_root)
+    store = store or RunStore.new(out_root, label=settings.fy_scope)
     # root_key identifies the input for resume-matching; for a local path it's the
-    # resolved path, for Drive the caller passes the folder id explicitly.
+    # resolved path, for Drive the caller passes the folder id explicitly. The FY the
+    # run was scoped to is a *second* half of that identity (see find_resumable) —
+    # an all-years run and a one-year run over the same tree are different corpora.
     root_key = root_key if root_key is not None else str(Path(root).resolve())
-    store.write_meta(root=root_key, complete=False)
+    store.write_meta(root=root_key, complete=False, fy=settings.fy_scope)
 
     def phase(name: str) -> None:
         if on_phase is not None:
@@ -225,7 +227,7 @@ def run_scan(root, out_root: Path, settings: Settings = DEFAULTS,
     result.finished_at = datetime.now().isoformat(timespec="seconds")
     store.save(result)
     write_master(result, store.master_path())
-    store.write_meta(root=root_key, complete=complete)
+    store.write_meta(root=root_key, complete=complete, fy=settings.fy_scope)
     reporter.finish(result.summary())
     return store, result
 

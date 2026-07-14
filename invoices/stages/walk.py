@@ -76,6 +76,37 @@ def _bank_from(rel_parts: list[str], scope: str) -> str | None:
     return None
 
 
+def norm_fy(name: str | None) -> str:
+    """Compare FY folder names ignoring case and spacing: 'FY 22-23' == 'fy22 - 23'.
+
+    RE_FY accepts all three spellings, so an exact `==` would silently prune the
+    whole tree for someone who typed `--fy FY22-23` at a folder named "FY 22-23" —
+    a clean, successful, zero-invoice run, which looks exactly like a broken tool.
+    """
+    return "".join((name or "").split()).upper()
+
+
+def keep_fy_dir(name: str, fy_scope: str | None) -> bool:
+    """Descend into this folder? Only the scoped year, when one is set.
+
+    Keyed on the *shape* (RE_FY) at any depth rather than on a fixed depth, so a
+    tree that nests its years still prunes correctly and a tree with no FY level is
+    left alone. Shared by both walkers so local and Drive can't drift apart.
+    """
+    if not fy_scope or not RE_FY.match(name):
+        return True
+    return norm_fy(name) == norm_fy(fy_scope)
+
+
+def list_fy_folders(root: Path | str) -> list[str]:
+    """The FY folder names directly under ``root`` — the year picker's options."""
+    try:
+        return sorted(p.name for p in Path(root).iterdir()
+                      if p.is_dir() and RE_FY.match(p.name))
+    except OSError:
+        return []
+
+
 def seed_document(source_key: str, path: str, filename: str, size_bytes: int,
                   info: PathInfo, **extra) -> Document:
     """Build the seed Document + its discovery event and path flags.
@@ -122,6 +153,18 @@ def walk(root: Path, settings: Settings = DEFAULTS,
         if control is not None:
             control.gate()          # a Stop during discovery lands here
         dirnames.sort()             # deterministic descent
+        # One financial year per run: PRUNE the other years' subtrees rather than
+        # filter their documents out, so we never descend them at all. The edit
+        # must be in place (`dirnames[:]`) — os.walk reads the list back after this
+        # iteration, and still does so when the bank gate below `continue`s (which
+        # it always does for the root dir, the only place the FY folders are
+        # visible — hence this sits *above* that gate).
+        #
+        # `root` stays the TREE root on purpose: re-rooting at the FY folder would
+        # drop the FY component from folder_parts, so _parse_path would set no
+        # info.fy and every single doc would come out flagged `path_incomplete`.
+        if settings.fy_scope:
+            dirnames[:] = [d for d in dirnames if keep_fy_dir(d, settings.fy_scope)]
         here = Path(dirpath)
         folder_parts = list(here.relative_to(root).parts)
 

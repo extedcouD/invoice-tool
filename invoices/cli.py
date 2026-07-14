@@ -32,17 +32,39 @@ def _resolve_run(args) -> RunStore:
     return RunStore(Path(run))
 
 
+def _resolve_fy(root: Path, fy: str | None) -> str | None:
+    """Validate --fy against the FY folders actually under --root, and return the
+    folder's REAL name (so run_meta and the run-id label stay canonical).
+
+    A typo'd year would otherwise prune the entire tree and 'succeed' with zero
+    invoices — indistinguishable from a broken scan, so fail loudly instead.
+    """
+    from .stages.walk import list_fy_folders, norm_fy
+
+    if not fy:
+        return None
+    years = list_fy_folders(root)
+    hit = next((y for y in years if norm_fy(y) == norm_fy(fy)), None)
+    if hit is None:
+        sys.exit(f"no financial-year folder matching {fy!r} under {root}\n"
+                 f"  available: {', '.join(years) or '(none)'}")
+    return hit
+
+
 def cmd_scan(args) -> None:
+    root = Path(args.root)
+    fy = _resolve_fy(root, getattr(args, "fy", None))
     settings = replace(
         DEFAULTS,
         workers=args.workers,
         ocr_enabled=not args.no_ocr,
+        fy_scope=fy,
     )
     gstr = Path(args.gstr) if getattr(args, "gstr", None) else None
-    store, result = run_scan(Path(args.root), Path(args.out), settings,
+    store, result = run_scan(root, Path(args.out), settings,
                              quiet=args.quiet, gstr_path=gstr)
     s = result.summary()
-    print(f"\nrun: {store.dir}")
+    print(f"\nrun: {store.dir}" + (f"   [{fy} only]" if fy else ""))
     print(f"  detections: {store.detections_path}")
     print(f"  draft xlsx: {store.master_path()}")
     print(f"  invoices={s['invoices']} flagged={s['flagged']} "
@@ -58,6 +80,15 @@ def cmd_scan(args) -> None:
         from .web.app import serve
         print("\nlaunching review app (Ctrl-C to stop)…")
         serve(store, port=args.port, open_browser=not args.no_browser)
+
+
+def cmd_years(args) -> None:
+    from .stages.walk import list_fy_folders
+
+    years = list_fy_folders(Path(args.root))
+    if not years:
+        sys.exit(f"no 'FY xx-yy' folders under {args.root}")
+    print("\n".join(years))
 
 
 def cmd_review(args) -> None:
@@ -105,6 +136,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sc = sub.add_parser("scan", parents=[web], help="scan a folder tree and detect invoices")
     sc.add_argument("--root", required=True, help="root folder to scan (FY.. tree)")
+    sc.add_argument("--fy", help="scan only this financial-year folder, e.g. 'FY 22-23' "
+                                 "(default: every FY under --root). One GSTR-2A workbook "
+                                 "covers one year, so scope the run to that year.")
     sc.add_argument("--gstr", help="GSTR-2A workbook to match against (enables the "
                                    "linking review: which B2B rows have no PDF)")
     sc.add_argument("--workers", type=int, default=1)
@@ -116,6 +150,10 @@ def build_parser() -> argparse.ArgumentParser:
     rv = sub.add_parser("review", parents=[web], help="launch the web review app for a run")
     rv.add_argument("--run", help="run dir (default: latest under --out)")
     rv.set_defaults(func=cmd_review)
+
+    yr = sub.add_parser("years", help="list the financial-year folders under a root")
+    yr.add_argument("--root", required=True, help="root folder (FY.. tree)")
+    yr.set_defaults(func=cmd_years)
 
     ex = sub.add_parser("export", help="(re)write master xlsx from a run")
     ex.add_argument("--run", help="run dir (default: latest under --out)")
