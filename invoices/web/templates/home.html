@@ -387,11 +387,13 @@ function finishDone(rs){
     $("go-review").textContent = (sm.flagged||0) ? `Review ${sm.flagged} flagged →` : "Open review →";
   }
 
-  if(hasNative()){
-    $("open-out").style.display = "inline-block";
-    $("open-out").onclick = () => window.pywebview.api.open_output();
-  }
-  // Drive: offer to publish results to a new Drive folder.
+  // Works in the browser fallback too — the server is this same machine.
+  $("open-out").style.display = "inline-block";
+  $("open-out").onclick = () => UI.openOutput($("open-out"));
+
+  // Drive: offer to publish results to a new Drive folder. This is one Drive
+  // round-trip per invoice, so it runs as a background task with a progress bar
+  // instead of a POST that sits silent for minutes.
   if(rs.source_mode === "drive"){
     const btn = $("drive-upload");
     if(rs.upload && rs.upload.ok){
@@ -401,19 +403,10 @@ function finishDone(rs){
     } else {
       btn.style.display = "inline-block";
       btn.disabled = false; btn.textContent = "☁️ Upload results to Drive";
-      btn.onclick = async () => {
-        btn.disabled = true; btn.textContent = "Uploading…";
-        try{
-          const r = await fetch("/api/drive/upload", {method:"POST"});
-          const j = await r.json();
-          if(j.ok){ $("upload-line").textContent =
-              `☁️ Uploaded to Drive folder “${j.folder}” (${j.invoices} invoices + master workbook).`;
-            btn.style.display = "none"; }
-          else { $("upload-line").textContent = "Upload failed: " + (j.error||"unknown error");
-            btn.disabled = false; btn.textContent = "☁️ Retry upload"; }
-        }catch(e){ $("upload-line").textContent = "Upload failed: " + e;
-          btn.disabled = false; btn.textContent = "☁️ Retry upload"; }
-      };
+      btn.onclick = () => UI.runTask("/api/drive/upload", {
+        title: "Uploading to Google Drive…",
+        done: () => location.reload(),      // run_state now carries the upload report
+      });
     }
   }
   show("done");

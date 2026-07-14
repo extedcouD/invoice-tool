@@ -61,6 +61,8 @@ class RunController:
         self.upload_report: Optional[dict] = None
         # The financial year this run is scoped to (None = every year under the root).
         self.fy: Optional[str] = None
+        # The current long post-scan job (export / Drive upload) and its progress.
+        self.task: Optional[dict] = None
         # The inputs of the last start, so "Resume" survives a page reload (it used
         # to live in a page-scoped JS variable and vanish on any navigation).
         self.last_input: Optional[dict] = None
@@ -245,7 +247,7 @@ class RunController:
                              self.file_source)
         return self.plan
 
-    def export_linked(self) -> Optional[Any]:
+    def export_linked(self, on_progress=None) -> Optional[Any]:
         """Write the linked workbook + flat invoice folder for the reviewed result.
 
         The expensive half of linking, deliberately deferred until review is done.
@@ -258,12 +260,57 @@ class RunController:
         if self.plan is None:
             self.rematch()
         report = write_linked(self.result, self.plan, self.gstr_path, self.store,
-                              self.file_source)
+                              self.file_source, on_progress=on_progress,
+                              workers=max(4, self.settings.workers))
         with self._lock:
             self.link_report = report
         return report
 
-    def upload_results(self) -> dict:
+    # ---- long post-scan jobs (export / Drive upload) ------------------------
+    # These are *slow* — on a Drive run each matched invoice is a network download,
+    # and each uploaded one a Drive round-trip. Run synchronously inside the POST
+    # they froze the whole window for minutes with no sign of life, and every review
+    # edit blocked behind the same write lock. So they run on a thread and publish
+    # progress that the page polls, exactly like the scan does.
+    def task_state(self) -> dict:
+        with self._lock:
+            t = dict(self.task) if self.task else {"kind": None, "phase": "idle"}
+        return t
+
+    @property
+    def task_running(self) -> bool:
+        return bool(self.task and self.task["phase"] == "running")
+
+    def _set_task(self, **fields) -> None:
+        with self._lock:
+            if self.task is not None:
+                self.task.update(fields)
+
+    def _progress(self, done: int, total: int) -> None:
+        self._set_task(done=done, total=total)
+
+    def start_task(self, kind: str, fn) -> dict:
+        """Run ``fn(progress)`` on a background thread as the named job."""
+        with self._lock:
+            if self.task is not None and self.task["phase"] == "running":
+                return {"ok": False, "error": f"'{self.task['kind']}' is already running."}
+            if self.phase in ("scanning", "linking", "finishing"):
+                return {"ok": False, "error": "The scan is still running."}
+            self.task = {"kind": kind, "phase": "running", "done": 0, "total": 0,
+                         "message": "", "error": None}
+
+        def run() -> None:
+            try:
+                fn(self._progress)
+                self._set_task(phase="done")
+            except Exception as exc:
+                traceback.print_exc()
+                self._set_task(phase="error", error=str(exc))
+
+        threading.Thread(target=run, daemon=True).start()
+        return {"ok": True, "kind": kind}
+
+    def upload_results(self, on_progress=None) -> dict:
         """Publish outputs to a NEW Google Drive folder (drive mode only).
 
         Creates ``<name>/`` with the master workbook plus an ``invoices/``
@@ -290,11 +337,17 @@ class RunController:
                     self.drive.upload_file(out, folder_id, mime=XLSX_MIME)
                     linked = True
             inv_folder = self.drive.create_folder("invoices", folder_id)
+            # One server-side copy per invoice — a network round-trip each, so report
+            # progress rather than sitting silent for minutes on a big run.
+            todo = [d for d in self.result.invoices() if d.drive_file_id]
             copied = 0
-            for d in self.result.invoices():
-                if d.drive_file_id:
-                    self.drive.copy_file(d.drive_file_id, inv_folder, name=d.filename)
-                    copied += 1
+            if on_progress:
+                on_progress(0, len(todo))
+            for d in todo:
+                self.drive.copy_file(d.drive_file_id, inv_folder, name=d.filename)
+                copied += 1
+                if on_progress:
+                    on_progress(copied, len(todo))
             report = {"ok": True, "folder": name, "folder_id": folder_id,
                       "invoices": copied, "linked_workbook": linked}
         except Exception as exc:

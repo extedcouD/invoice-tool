@@ -18,7 +18,8 @@
   {% if rm.manual %}
   <div style="margin-top:12px">
     <span class="pill ok">bound by hand</span>
-    <form method="post" action="{{ url_for('bind_row', row=rm.row) }}" style="display:inline">
+    <form method="post" action="{{ url_for('bind_row', row=rm.row) }}"
+          style="display:inline" data-busy="Undoing…">
       <button class="btn ghost sm" type="submit">Undo this binding</button>
     </form>
   </div>
@@ -64,7 +65,8 @@
       {% else %}<span class="muted">—</span>{% endif %}</td>
       <td class="right" style="white-space:nowrap">
         <a class="btn ghost sm" href="{{ url_for('doc_detail', doc_id=d.id) }}">Preview</a>
-        <form method="post" action="{{ url_for('bind_row', row=rm.row) }}" style="display:inline">
+        <form method="post" action="{{ url_for('bind_row', row=rm.row) }}"
+              style="display:inline" data-busy="Binding…">
           <input type="hidden" name="doc_id" value="{{ d.id }}">
           <button class="btn sm" type="submit">Bind</button>
         </form>
@@ -167,7 +169,7 @@
       <td>${score}</td>
       <td class="right" style="white-space:nowrap">
         <a class="btn ghost sm" href="/doc/${esc(h.id)}">Preview</a>
-        <form method="post" action="${BIND}" style="display:inline"
+        <form method="post" action="${BIND}" style="display:inline" data-busy="Binding…"
               data-confirm="${h.is_invoice ? "" : esc(h.filename)}">
           <input type="hidden" name="doc_id" value="${esc(h.id)}">
           <button class="btn sm" type="submit">Bind</button>
@@ -221,11 +223,17 @@
     if(!s){ hits = []; ac.hidden = true; $("#search-results").innerHTML = ""; return; }
     let r;
     try{ r = await fetch("/api/link/search?q=" + encodeURIComponent(s)).then(x => x.json()); }
-    catch(e){ return; }
+    catch(e){
+      // Say so. Swallowing this left the pane blank and the page looking broken.
+      $("#search-results").innerHTML =
+        `<div class="banner bad">Search failed: ${esc(e)}. Is the scan still running?</div>`;
+      return;
+    }
     if(q.value.trim() !== s) return;      // a newer keystroke already won
     hits = r.hits; sel = -1;
     if(typing) drawAc(); else ac.hidden = true;
     $("#search-results").innerHTML = table(hits);
+    UI.armForms($("#search-results"));    // the Bind forms here are built by JS
   }
   q.oninput = () => { clearTimeout(timer); timer = setTimeout(() => search(true), 140); };
   q.onkeydown = e => {
@@ -245,8 +253,13 @@
 
   async function browse(prefix, highlight){
     let b;
+    $("#browse-results").innerHTML = `<div class="card"><span class="spin"></span> Loading…</div>`;
     try{ b = await fetch("/api/link/browse?prefix=" + encodeURIComponent(prefix || "")).then(x => x.json()); }
-    catch(e){ return; }
+    catch(e){
+      $("#browse-results").innerHTML =
+        `<div class="banner bad">Could not load that folder: ${esc(e)}</div>`;
+      return;
+    }
 
     const crumbs = [`<a href="#" data-p="">📂 all folders</a>`].concat(
       b.crumbs.map(c => `<span>/</span><a href="#" data-p="${esc(c.path.join("/"))}">${esc(c.name)}</a>`));
@@ -268,6 +281,7 @@
 
     $("#browse-results").querySelectorAll("tr.folder").forEach(tr =>
       tr.onclick = () => browse(tr.dataset.p));
+    UI.armForms($("#browse-results"));    // the Bind forms here are built by JS
     if(highlight){
       const r = $("#browse-results").querySelector(`input[value="${highlight}"]`);
       if(r) r.closest("tr").style.outline = "1px solid var(--accent)";

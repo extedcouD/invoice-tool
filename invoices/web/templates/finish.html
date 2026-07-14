@@ -35,18 +35,8 @@
 {% endif %}
 
 <div class="flex" style="gap:12px;flex-wrap:wrap;margin-top:6px">
-  <button class="btn big" id="open-out" type="button" style="display:none">Open output folder</button>
+  <button class="btn big" type="button" data-open-output>📂 Open output folder</button>
   <a class="btn big ghost" href="{{ url_for('review') }}">← Back to review</a>
   <a class="btn big ghost" href="{{ url_for('home') }}">Home</a>
 </div>
-
-<script>
-  // In the native desktop app, offer a one-click "open folder"; browsers get the
-  // copyable paths above.
-  if(window.pywebview && window.pywebview.api){
-    const b = document.getElementById("open-out");
-    b.style.display = "inline-block";
-    b.onclick = () => window.pywebview.api.open_output();
-  }
-</script>
 {% endblock %}

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import sys
 import threading
 import time
@@ -95,6 +96,17 @@ def file_id_from(value: str) -> str:
         if m:
             return m.group(1)
     return value
+
+def _safe_filename(name: str, ext: str) -> str:
+    """A Drive file's name, made safe to write to disk, with ``ext`` enforced.
+
+    Kept because the GSTR-2A workbook's name is load-bearing downstream: the export
+    is named `<stem>_linked.xlsx` after it, and it is the copy kept in the run dir.
+    """
+    stem = Path(name).stem.strip() or "GSTR2A"
+    stem = re.sub(r"[^\w\-. ]+", "_", stem)[:120]
+    return f"{stem}{ext}"
+
 
 # Transient Drive errors we retry with exponential backoff.
 _RETRY_STATUS = {403, 429, 500, 502, 503, 504}
@@ -342,6 +354,12 @@ class DriveClient:
         A native Google Sheet has no bytes to download — ``get_media`` fails on it
         — so it has to be *exported* to xlsx instead. Users paste whichever link
         they have, so handle both rather than making them convert by hand.
+
+        The download keeps the workbook's **real Drive name** (in a temp *directory*,
+        rather than a `tmpXXXX.xlsx` temp file), because that name is not cosmetic:
+        the export is named after it (`<stem>_linked.xlsx`) and it is the copy kept
+        in the run dir. A bare mkstemp meant every Drive run produced
+        `tmpnpkuwvev_linked.xlsx` instead of `GSTR2A_Return_linked.xlsx`.
         """
         import tempfile
 
@@ -353,15 +371,15 @@ class DriveClient:
             raise ValueError(
                 f"{meta.get('name', file_id)!r} is a folder, not a GSTR-2A workbook.")
 
-        if mime != SHEET_MIME:
-            return self.download_to_temp(file_id, suffix=".xlsx")
-
-        fd, tmp = tempfile.mkstemp(suffix=".xlsx", prefix="invgstr_")
-        os.close(fd)
+        name = _safe_filename(meta.get("name") or "GSTR2A", ".xlsx")
+        tmp = str(Path(tempfile.mkdtemp(prefix="invgstr_")) / name)
+        request = (self._svc.files().export_media(fileId=file_id, mimeType=XLSX_MIME)
+                   if mime == SHEET_MIME
+                   else self._svc.files().get_media(fileId=file_id,
+                                                    supportsAllDrives=True))
         try:
             with open(tmp, "wb") as fh:
-                downloader = MediaIoBaseDownload(fh, self._svc.files().export_media(
-                    fileId=file_id, mimeType=XLSX_MIME))
+                downloader = MediaIoBaseDownload(fh, request)
                 done = False
                 while not done:
                     _, done = downloader.next_chunk()
