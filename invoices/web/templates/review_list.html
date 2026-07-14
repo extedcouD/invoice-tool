@@ -31,12 +31,12 @@
     </div>
     {% endif %}
   </div>
-  {% if not locked %}
-  <form method="post" action="{{ url_for('finish') }}"
-        onsubmit="return confirm({% if flagged %}'Export now? {{ flagged|length }} document(s) are still unreviewed and will be exported as-is.'{% else %}'Write the final GSTR-linked workbook and matched-invoice folder now?'{% endif %})">
-    <button class="btn big" type="submit">Finish &amp; export →</button>
-  </form>
-  {% endif %}
+  <div class="flex" style="gap:10px;flex-wrap:wrap">
+    <button class="btn ghost" type="button" data-open-output>📂 Open output folder</button>
+    {% if not locked %}
+    <button class="btn big" type="button" id="finish-btn">Finish &amp; export →</button>
+    {% endif %}
+  </div>
 </div>
 
 {% if locked %}
@@ -137,7 +137,7 @@
     <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
       <p class="muted" style="margin:0">Sorted worst-first. Click a row to preview the PDF and confirm/correct.</p>
       {% if not locked %}
-      <form method="post" action="{{ url_for('approve_all') }}"
+      <form method="post" action="{{ url_for('approve_all') }}" data-busy="Approving…"
             onsubmit="return confirm('Approve all {{ flagged|length }} flagged document(s) as-is? This marks them reviewed without edits.')">
         <button class="btn ghost sm" type="submit">✓ Approve all ({{ flagged|length }})</button>
       </form>
@@ -169,4 +169,26 @@
     </table>
   {% endif %}
 {% endif %}
+
+<script>
+// Finish & export is the longest thing the app does — on a Drive run it downloads
+// every matched invoice. It runs as a background task with a progress bar rather
+// than a POST that freezes the window for minutes.
+(function(){
+  const b = document.getElementById("finish-btn");
+  if(!b) return;
+  b.onclick = () => {
+    const msg = {% if flagged %}
+      "Export now? {{ flagged|length }} document(s) are still unreviewed and will be exported as-is."
+    {% else %}
+      "Write the final GSTR-linked workbook and matched-invoice folder now?"
+    {% endif %};
+    if(!confirm(msg)) return;
+    UI.runTask("{{ url_for('finish') }}", {
+      title: "Exporting — writing the workbook and collecting the PDFs…",
+      done: () => { location.href = "{{ url_for('finish_page') }}"; },
+    });
+  };
+})();
+</script>
 {% endblock %}

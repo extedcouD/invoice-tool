@@ -66,6 +66,13 @@
     border-top-color:var(--accent);display:inline-block;vertical-align:-2px;
     animation:spin .8s linear infinite}
   @keyframes spin{to{transform:rotate(360deg)}}
+  /* a spinner that sits inside a button while its action is in flight */
+  .spin.sm{width:11px;height:11px;border-width:2px;vertical-align:-1px;margin-right:4px}
+  /* blocking overlay for the long jobs (export / Drive upload) */
+  #busy-ov{display:none;position:fixed;inset:0;z-index:50;background:rgba(8,10,14,.72);
+    align-items:center;justify-content:center}
+  #busy-ov .box{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:20px 22px;width:min(440px,90vw)}
   .banner{border-radius:10px;padding:10px 14px;margin-bottom:14px;font-weight:600;
     background:rgba(63,179,127,.12);color:var(--ok);border:1px solid rgba(63,179,127,.4)}
   .banner.bad{background:rgba(229,96,95,.12);color:var(--bad);border:1px solid rgba(229,96,95,.4)}
@@ -176,6 +183,135 @@
 })();
 </script>
 {% endif %}
+
+<!-- Blocking progress overlay for the long post-scan jobs (export / Drive upload).
+     These take minutes on a Drive run — one network round-trip per invoice — and
+     running them inside the POST with no feedback was indistinguishable from the
+     app being broken: you clicked, nothing happened, and everything else you
+     clicked queued behind it. -->
+<div id="busy-ov">
+  <div class="box">
+    <div class="flex" style="gap:12px;align-items:center">
+      <span class="spin"></span>
+      <b id="bo-title">Working…</b>
+    </div>
+    <div class="bar" id="bo-barwrap" style="margin:14px 0 8px"><span id="bo-bar" style="width:0%"></span></div>
+    <div class="muted mono" id="bo-text"></div>
+    <div class="banner bad" id="bo-err" style="display:none;margin-top:12px"></div>
+    <div style="margin-top:14px;text-align:right">
+      <button class="btn ghost sm" id="bo-close" type="button" style="display:none">Close</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ---- shared UI helpers ----------------------------------------------------
+// Every mutating action in this app can be slow (a Drive run makes each one a
+// network call), so nothing may look inert after a click: buttons go busy, long
+// jobs get a real progress bar.
+window.UI = (function(){
+  const $ = id => document.getElementById(id);
+  const ov = $("busy-ov");
+
+  function busy(btn, label){
+    if(!btn) return () => {};
+    const html = btn.innerHTML, dis = btn.disabled;
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spin sm"></span> ${label || "Working…"}`;
+    return () => { btn.disabled = dis; btn.innerHTML = html; };   // restore
+  }
+
+  // Disable a whole <form>'s submit button the moment it is submitted, so a slow
+  // POST can't be fired twice by an impatient second click.
+  //
+  // Deferred to a task, not run inline: some of these forms are *also* guarded by a
+  // delegated confirm() on document, which bubbles — so it runs AFTER this handler.
+  // Arming inline would leave the button stuck on "Binding…" forever whenever the
+  // user cancelled the confirm. By the next tick, defaultPrevented is the truth.
+  function armForms(root){
+    (root || document).querySelectorAll("form[data-busy]").forEach(f => {
+      if(f.dataset.armed) return;
+      f.dataset.armed = "1";
+      f.addEventListener("submit", e => setTimeout(() => {
+        if(e.defaultPrevented) return;          // a confirm() said no
+        const b = f.querySelector("button[type=submit], button:not([type])");
+        if(b) busy(b, f.dataset.busy || "Working…");
+      }, 0));
+    });
+  }
+
+  function showOverlay(title){
+    $("bo-title").textContent = title;
+    $("bo-err").style.display = "none";
+    $("bo-close").style.display = "none";
+    $("bo-bar").style.width = "0%";
+    $("bo-text").textContent = "";
+    $("bo-barwrap").classList.add("indet");
+    ov.style.display = "flex";
+  }
+  function failOverlay(msg){
+    $("bo-title").textContent = "That didn't work";
+    $("bo-barwrap").classList.remove("indet");
+    $("bo-err").textContent = msg;
+    $("bo-err").style.display = "block";
+    $("bo-close").style.display = "inline-block";
+  }
+  $("bo-close").onclick = () => { ov.style.display = "none"; };
+
+  // POST a long job, then poll /api/task until it lands. onDone() runs on success;
+  // a failure stays on screen with the reason instead of vanishing silently.
+  async function runTask(url, {title, done}){
+    showOverlay(title);
+    try{
+      const r = await fetch(url, {method:"POST"});
+      const j = await r.json();
+      if(!j.ok){ failOverlay(j.error || "Could not start."); return; }
+    }catch(e){ failOverlay(String(e)); return; }
+
+    for(;;){
+      await new Promise(r => setTimeout(r, 600));
+      let t;
+      try{ t = await fetch("/api/task").then(r => r.json()); }
+      catch(e){ continue; }                       // transient — keep polling
+
+      if(t.total > 0){
+        $("bo-barwrap").classList.remove("indet");
+        $("bo-bar").style.width = Math.round(100 * t.done / t.total) + "%";
+        $("bo-text").textContent = `${t.done.toLocaleString()} / ${t.total.toLocaleString()}`;
+      }
+      if(t.phase === "error"){ failOverlay(t.error || "Failed."); return; }
+      if(t.phase === "done"){ done(); return; }
+    }
+  }
+
+  // Reveal the run folder. The desktop bridge does it natively; the browser
+  // fallback asks the server, which is the same machine anyway.
+  async function openOutput(btn){
+    const restore = busy(btn, "Opening…");
+    try{
+      if(window.pywebview && window.pywebview.api && window.pywebview.api.open_output){
+        await window.pywebview.api.open_output();
+      } else {
+        const j = await fetch("/api/open_output", {method:"POST"}).then(r => r.json());
+        if(!j.ok) alert(j.error + (j.path ? `\n\n${j.path}` : ""));
+      }
+    }catch(e){ alert(String(e)); }
+    restore();
+  }
+
+  // This script runs before the page body exists, so nothing here may bind to a body
+  // element directly: arm on DOMContentLoaded, and reach the open-output buttons by
+  // delegation so they work wherever (and whenever) a page adds one.
+  // (And never write a Jinja tag in these comments — Jinja parses the whole file.)
+  document.addEventListener("DOMContentLoaded", () => armForms());
+  document.addEventListener("click", e => {
+    const b = e.target.closest && e.target.closest("[data-open-output]");
+    if(b){ e.preventDefault(); openOutput(b); }
+  });
+
+  return {busy, runTask, openOutput, armForms};
+})();
+</script>
 
 <div class="wrap">{% block body %}{% endblock %}</div>
 </body>

@@ -63,7 +63,7 @@
   <!-- editable fields + trace -->
   <div class="col">
     <h2>Fields <span class="muted">(edit &amp; confirm — saving re-runs the GSTR match)</span></h2>
-    <form method="post" action="{{ url_for('confirm', doc_id=d.id) }}">
+    <form method="post" action="{{ url_for('confirm', doc_id=d.id) }}" data-busy="Saving…">
       <div class="grid" style="grid-template-columns:1fr 1fr;gap:10px">
         <div><label>invoice_id (filename)</label>
           <input name="invoice_id" value="{{ d.fields.invoice_id or '' }}"></div>
@@ -88,7 +88,7 @@
     </form>
 
     {% if d.is_invoice and not locked %}
-    <form method="post" action="{{ url_for('reject', doc_id=d.id) }}" style="margin-top:10px"
+    <form method="post" action="{{ url_for('reject', doc_id=d.id) }}" style="margin-top:10px" data-busy="Rejecting…"
           onsubmit="return confirm('Mark this as NOT an invoice? It will be dropped from the master workbook and from the GSTR match.')">
       <button class="btn ghost" type="submit">✕ Not an invoice</button>
       <span class="muted" style="margin-left:8px">Removes it from the master and the match.</span>

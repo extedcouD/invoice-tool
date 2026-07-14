@@ -179,6 +179,25 @@ Key structural facts (each requires reading several files to reconstruct):
   detected invoices to a new Drive folder (invoices via server-side `files.copy` — originals are
   never modified). OAuth needs a user-supplied `client_secret.json` in the app-support dir
   (`io/drive.app_support_dir()`); the frozen bundle can be smoke-tested with `--selftest`.
+- **Nothing slow may run inside a request.** The two long post-scan jobs — "Finish & export"
+  (`/finish`) and the Drive upload (`/api/drive/upload`) — are *per-invoice network work*:
+  `write_linked` pulls every matched PDF's bytes through the `FileSource`, and the upload does
+  one `files.copy` each. Run inline they took **minutes** on a Drive run with the window frozen
+  and no progress, so the user concluded the buttons were dead — and because the route held the
+  app write-lock, every review edit queued behind them too. They now go through
+  `RunController.start_task()` on a thread, publish `{done,total}`, and the page polls
+  `/api/task` behind a progress overlay. `write_linked` fetches in a `ThreadPoolExecutor` (it is
+  network-bound) but writes every openpyxl cell on the calling thread — hence its three passes:
+  decide rows → fetch in parallel → stamp cells. `_locked()` covers a running task as well as a
+  running scan, because the export reads `result` while writing.
+- **A review edit must not rewrite the corpus.** `_persist` saves `detections.json` only, *not*
+  the master workbook: `write_master` is O(corpus) (~1s per 20k docs in openpyxl), and paying
+  that on every bind/approve click is what made them feel broken. `/finish` and `/export` write
+  the master from that same result.
+- **The GSTR-2A workbook's *name* is load-bearing.** The export is `<stem>_linked.xlsx` after it
+  and it is the copy kept in the run dir, so `download_workbook_to_temp` downloads into a temp
+  *directory* under the real Drive name — a bare `mkstemp` shipped the user
+  `tmpnpkuwvev_linked.xlsx` as their deliverable.
 - **Fault isolation.** `Pipeline.run_one` wraps each stage in try/except: a failure flags
   `stage_error` on that one doc and the run continues. Never let a stage crash the whole run.
 - **`workers > 1` uses a `ThreadPoolExecutor`, not processes.** OCR shells out to the

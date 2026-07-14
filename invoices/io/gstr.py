@@ -28,9 +28,10 @@ from __future__ import annotations
 
 import re
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from openpyxl import load_workbook
 
@@ -382,11 +383,24 @@ def suggest(row: B2BRow, invoices: Iterable[Document], limit: int = 5) -> list[t
 # --------------------------------------------------------------------------- #
 # 3 · write the linked workbook + flat folder
 # --------------------------------------------------------------------------- #
+def _flag_cell(cell, text: str) -> None:
+    cell.value = text
+    cell.fill = _FLAG_FILL
+
+
 def write_linked(result: RunResult, plan: LinkPlan, gstr_path: Path, store: RunStore,
                  file_source: FileSource | None = None,
                  sheet_name: str = DEFAULT_SHEET,
-                 ref_header: str = DEFAULT_REF_HEADER) -> LinkReport:
-    """Materialize ``plan``: copy the matched PDFs and write ``<stem>_linked.xlsx``."""
+                 ref_header: str = DEFAULT_REF_HEADER,
+                 on_progress: Optional[Callable[[int, int], None]] = None,
+                 workers: int = 8) -> LinkReport:
+    """Materialize ``plan``: copy the matched PDFs and write ``<stem>_linked.xlsx``.
+
+    ``on_progress(done, total)`` is called as the PDFs land. This is the expensive
+    half of linking — on a Drive run every matched row is a network download — so the
+    caller runs it on a background thread and shows a real progress bar rather than
+    freezing the window for minutes with no sign of life.
+    """
     gstr_path = Path(gstr_path)
     file_source = file_source or LocalFileSource()
     by_id = {d.id: d for d in result.invoices()}
@@ -415,59 +429,80 @@ def write_linked(result: RunResult, plan: LinkPlan, gstr_path: Path, store: RunS
                      unreferenced_invoices=counts["unreferenced"])
     used_names: set[str] = set()
 
+    # ---- pass 1: decide every row, serially. No I/O, so the flat-name uniqueness
+    # check stays deterministic and openpyxl is only touched from this thread.
+    to_copy: list[tuple] = []          # (rm, doc, flat name)
     for rm in plan.rows:
-        ref_cell = ws.cell(row=rm.row, column=ref_col)
-
         if rm.status == NOT_FOUND:
             rep.not_found += 1
             rep.unmatched_rows.append((rm.row, rm.gstin, rm.invoice_no))
-            ref_cell.value = "NOT FOUND"
-            ref_cell.fill = _FLAG_FILL
+            _flag_cell(ws.cell(row=rm.row, column=ref_col), "NOT FOUND")
             continue
 
         if rm.status == AMBIGUOUS:
             rep.ambiguous += 1
             rep.ambiguous_rows.append(
                 (rm.row, rm.gstin, rm.invoice_no, len(rm.candidates)))
-            ref_cell.value = f"AMBIGUOUS ({len(rm.candidates)})"
-            ref_cell.fill = _FLAG_FILL
+            _flag_cell(ws.cell(row=rm.row, column=ref_col),
+                       f"AMBIGUOUS ({len(rm.candidates)})")
             continue
 
         doc = by_id.get(rm.doc_id or "")
         if doc is None:  # a bound doc that is no longer an invoice (rejected in review)
             rep.not_found += 1
             rep.unmatched_rows.append((rm.row, rm.gstin, rm.invoice_no))
-            ref_cell.value = "NOT FOUND"
-            ref_cell.fill = _FLAG_FILL
+            _flag_cell(ws.cell(row=rm.row, column=ref_col), "NOT FOUND")
             continue
 
         name = _flat_name(rm.gstin, rm.invoice_no)
         while name in used_names:  # extremely unlikely; guarantees folder uniqueness
             name = name[:-4] + "-dup.pdf"
+        used_names.add(name)
+        to_copy.append((rm, doc, name))
 
-        # Bytes come through the FileSource: on a Drive run doc.path is a display
-        # string, not a file, so a plain shutil.copy2(doc.path) would fail for
-        # every single matched row.
+    # ---- pass 2: fetch the bytes, in PARALLEL.
+    # Bytes come through the FileSource: on a Drive run doc.path is a display string,
+    # not a file, so a plain shutil.copy2(doc.path) would fail for every matched row —
+    # and each materialize() is a network download. Serially that was the single
+    # longest thing the app ever did (hundreds of sequential downloads over a slow
+    # link, inside one request, with the UI frozen and no progress). It is network-
+    # bound, so threads give real parallelism, and we report progress as they land.
+    def _fetch(item) -> tuple:
+        rm, doc, name = item
         try:
             local = file_source.materialize(doc)
         except Exception:
-            rep.copy_failed += 1
-            ref_cell.value = "COPY FAILED"
-            ref_cell.fill = _FLAG_FILL
-            continue
+            return rm, name, False
         try:
             shutil.copy2(local, flat_dir / name)
+            return rm, name, True
         except OSError:
-            rep.copy_failed += 1
-            ref_cell.value = "COPY FAILED"
-            ref_cell.fill = _FLAG_FILL
-            continue
+            return rm, name, False
         finally:
             file_source.cleanup(doc, local)
 
-        used_names.add(name)
-        rep.matched += 1
-        ref_cell.value = name
+    results: list[tuple] = []
+    if to_copy:
+        done = 0
+        if on_progress:
+            on_progress(0, len(to_copy))
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+            for out in ex.map(_fetch, to_copy):
+                results.append(out)
+                done += 1
+                if on_progress:
+                    on_progress(done, len(to_copy))
+
+    # ---- pass 3: stamp the outcomes back into the sheet, serially (openpyxl is
+    # not thread-safe, so no cell is touched from a worker).
+    for rm, name, ok in results:
+        cell = ws.cell(row=rm.row, column=ref_col)
+        if ok:
+            rep.matched += 1
+            cell.value = name
+        else:
+            rep.copy_failed += 1
+            _flag_cell(cell, "COPY FAILED")
 
     _autosize(ws, [ref_header])
     _write_report_sheet(wb, rep, gstr_path, sheet_name)

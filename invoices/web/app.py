@@ -18,6 +18,9 @@ Two things it deliberately does *not* do any more:
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import threading
 import webbrowser
 from pathlib import Path
@@ -246,9 +249,20 @@ def create_app(controller: RunController) -> Flask:
 
     @app.route("/api/drive/upload", methods=["POST"])
     def api_drive_upload():
-        """Publish the master + detected invoices to a new Drive folder."""
-        res = controller.upload_results()
-        return jsonify(res), (200 if res.get("ok") else 400)
+        """Publish the master + detected invoices to a new Drive folder.
+
+        Backgrounded: it is one Drive round-trip per invoice, so on a real run this
+        takes minutes. The page polls /api/task for progress.
+        """
+        def job(progress) -> None:
+            rep = controller.upload_results(on_progress=progress)
+            # upload_results reports failure by returning, not raising — surface it as
+            # a failed task, or the UI would call a failed upload "done".
+            if not rep.get("ok"):
+                raise RuntimeError(rep.get("error") or "Upload failed.")
+
+        res = controller.start_task("upload", job)
+        return jsonify(res), (200 if res.get("ok") else 409)
 
     @app.route("/api/docs")
     def api_docs():
@@ -331,20 +345,26 @@ def create_app(controller: RunController) -> Flask:
     _MONEY_FIELDS = ("taxable_value", "total_value")
 
     def _persist(r) -> None:
+        # detections.json only — NOT the master workbook. The master is O(corpus) to
+        # write (~1s per 20k documents in openpyxl) and rewriting it on every single
+        # click made each bind/approve feel broken, for a file nobody reads until the
+        # end. `/finish` and `/export` both rewrite it from this same result.
         controller.store.save(r)
-        write_master(r, controller.store.master_path())
         # An edit can change a vendor name or promote a doc to an invoice, both of
         # which the path index has baked in — drop it rather than serve stale hits.
         index_cache["gen"] += 1
 
     def _locked() -> bool:
-        """Review is read-only while a scan is running.
+        """Review is read-only while a scan — or a long export/upload — is running.
 
         Mid-scan you are looking at the live checkpoint, and `run_scan` rebuilds
         detections.json from that checkpoint when it finishes — so an edit made now
         would be silently thrown away at the end. Browse freely, edit when it lands.
+
+        An export is also excluded: it reads `result` while writing the workbook, so
+        an edit landing mid-write would be half-captured.
         """
-        return controller.busy
+        return controller.busy or controller.task_running
 
     @app.route("/doc/<doc_id>/confirm", methods=["POST"])
     def confirm(doc_id):
@@ -444,31 +464,74 @@ def create_app(controller: RunController) -> Flask:
 
     @app.route("/finish", methods=["POST"])
     def finish():
-        """Finalize review: write the master, then the linked workbook + flat folder.
+        """Kick off the export on a background thread; the page polls /api/task.
 
-        Runs *after* review so corrections reach the linked workbook, and renders a
-        page naming every file it wrote.
+        This used to run inline. On a Drive run it downloads every matched invoice,
+        so the request could take *minutes* — the window sat frozen with no progress,
+        the user assumed nothing had happened, and every review edit blocked behind
+        the same write lock. Now it returns immediately and reports progress.
         """
         r = result()
         if r is None or controller.store is None:
-            return redirect(url_for("home"))
+            return jsonify({"ok": False, "error": "No run to export."}), 400
         if _locked():
-            return redirect(url_for("review", locked=1))
-        report, error = None, None
-        with lock:
-            master = write_master(r, controller.store.master_path())
-            if controller.gstr_path:
-                try:
-                    report = controller.export_linked()
-                except Exception as exc:  # surface on-page, don't 500
-                    error = f"Linking failed: {exc}"
-            else:
-                error = ("No GSTR-2A workbook was chosen for this run, so there is "
-                         "nothing to link — only the master workbook was written.")
-        return render_template("finish.html", report=report, error=error,
-                               master_path=str(master), store=controller.store,
-                               remaining=len(r.flagged()),
+            return jsonify({"ok": False,
+                            "error": "A scan or export is already running."}), 409
+
+        def job(progress) -> None:
+            with lock:
+                write_master(r, controller.store.master_path())
+                if controller.gstr_path:
+                    controller.export_linked(on_progress=progress)
+
+        res = controller.start_task("export", job)
+        return jsonify(res), (200 if res.get("ok") else 409)
+
+    @app.route("/finish")
+    def finish_page():
+        """The report page, rendered once the export task has finished."""
+        r = result()
+        if r is None or controller.store is None:
+            return redirect(url_for("home"))
+        task = controller.task_state()
+        error = task.get("error")
+        if error:
+            error = f"Linking failed: {error}"
+        elif not controller.gstr_path:
+            error = ("No GSTR-2A workbook was chosen for this run, so there is "
+                     "nothing to link — only the master workbook was written.")
+        return render_template("finish.html", report=controller.link_report,
+                               error=error,
+                               master_path=str(controller.store.master_path()),
+                               store=controller.store, remaining=len(r.flagged()),
                                state=controller.run_state())
+
+    @app.route("/api/task")
+    def api_task():
+        """Progress of the current long job (export / Drive upload)."""
+        return jsonify(controller.task_state())
+
+    @app.route("/api/open_output", methods=["POST"])
+    def api_open_output():
+        """Reveal the run folder in Finder/Explorer.
+
+        Server-side (not just the pywebview bridge) so it also works in the browser
+        fallback — the app *is* the local machine here, so there is nothing to be
+        gained by making the user copy a path out of the page by hand.
+        """
+        if controller.store is None:
+            return jsonify({"ok": False, "error": "No run yet."}), 400
+        d = controller.store.dir.resolve()
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(d)])
+            elif os.name == "nt":
+                os.startfile(str(d))            # noqa: S606 - local desktop app
+            else:
+                subprocess.Popen(["xdg-open", str(d)])
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc), "path": str(d)}), 500
+        return jsonify({"ok": True, "path": str(d)})
 
     @app.route("/export", methods=["POST"])
     def export():
