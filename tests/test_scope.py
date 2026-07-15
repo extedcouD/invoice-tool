@@ -1,19 +1,17 @@
 """One financial year per run: the FY scope filter.
 
-Pure — no scan, no OCR, no network, no Drive auth. The client's GSTR-2A returns
-arrive one workbook per financial year, so a run is scoped to one FY folder and the
-other years' subtrees are never descended.
+Pure — no scan, no OCR, no network. The client's GSTR-2A returns arrive one workbook
+per financial year, so a run is scoped to one FY folder and the other years' subtrees
+are never descended.
 """
 from __future__ import annotations
 
-import json
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from invoices.config import DEFAULTS
-from invoices.io.drive import DriveClient, FOLDER_MIME, PDF_MIME, walk_drive
 from invoices.io.runstore import RunStore
 from invoices.stages import walk as walkmod
 from invoices.stages.walk import keep_fy_dir, list_fy_folders, norm_fy, walk
@@ -131,55 +129,3 @@ def test_the_run_dir_carries_the_year(tmp_path: Path) -> None:
     store = RunStore.new(tmp_path, run_id="20260101-000000", label="FY 22-23")
     assert store.dir.name == "run_20260101-000000_FY-22-23"
     assert store.master_path().name == "master_20260101-000000_FY-22-23.xlsx"
-
-
-# ---- Drive: the prune must skip the LISTING, not just the download ---------
-class FakeDrive(DriveClient):
-    """No network, no auth: _svc is a lazy property and list_children is the only
-    thing walk_pdf_tree touches."""
-
-    def __init__(self, tree: dict) -> None:
-        super().__init__(None)
-        self.tree, self.listed = tree, []
-
-    def list_children(self, folder_id: str) -> list[dict]:
-        self.listed.append(folder_id)
-        return self.tree.get(folder_id, [])
-
-
-def _folder(fid: str, name: str) -> dict:
-    return {"id": fid, "name": name, "mimeType": FOLDER_MIME}
-
-
-def _drive_tree() -> dict:
-    """root -> FY 22-23 / FY 23-24 -> Payments -> Kotak -> Sep-2022 -> 24-Sep-2022 -> Co -> pdf"""
-    tree: dict = {"root": [_folder("fy2223", "FY 22-23"), _folder("fy2324", "FY 23-24")]}
-    for fid, fy in (("fy2223", "FY 22-23"), ("fy2324", "FY 23-24")):
-        chain = [(f"{fid}-pay", "Payments"), (f"{fid}-kotak", "Kotak"),
-                 (f"{fid}-mon", "Sep-2022"), (f"{fid}-day", "24-Sep-2022"),
-                 (f"{fid}-co", "Apex Business Consultants Pvt Ltd")]
-        parent = fid
-        for cid, name in chain:
-            tree[parent] = [_folder(cid, name)]
-            parent = cid
-        tree[parent] = [{"id": f"{fid}-pdf", "name": f"invoice_{fy}.pdf",
-                         "mimeType": PDF_MIME, "size": "10", "modifiedTime": "2026-01-01"}]
-    return tree
-
-
-def test_walk_drive_prunes_the_other_years_listings() -> None:
-    fake = FakeDrive(_drive_tree())
-    docs = list(walk_drive("root", replace(DEFAULTS, fy_scope="FY 22-23"), client=fake))
-
-    assert {d.path_info.fy for d in docs} == {"FY 22-23"}
-    assert all("path_incomplete" not in {f.code for f in d.flags} for d in docs)
-    # The listing is the network cost on Drive, and the scope gate in walk_drive
-    # runs *after* it — so asserting only on the yielded docs would not prove the
-    # other year's subtree was skipped rather than merely filtered out.
-    assert not [f for f in fake.listed if f.startswith("fy2324")]
-
-
-def test_walk_drive_unscoped_still_walks_every_year() -> None:
-    fake = FakeDrive(_drive_tree())
-    docs = list(walk_drive("root", DEFAULTS, client=fake))
-    assert {d.path_info.fy for d in docs} == set(YEARS)

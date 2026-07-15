@@ -14,7 +14,7 @@ Resumability: each document is appended to ``checkpoint.jsonl`` the moment it
 finishes, so an interrupted scan keeps its work. A resumed run skips every source
 already in the checkpoint (keyed by :attr:`Document.source_key`) and the final
 ``detections.json`` is assembled from the ledger. This matters for very large
-(e.g. 120 GB Google-Drive) trees where a run spans hours and may be interrupted.
+(e.g. 120 GB) trees where a run spans hours and may be interrupted.
 """
 from __future__ import annotations
 
@@ -202,6 +202,35 @@ class RunStore:
         """The financial year this run was scoped to, or None if it scanned all years."""
         return self.read_meta().get("fy")
 
+    def describe(self) -> dict:
+        """A self-contained summary of this run folder for the "continue" UI + CLI:
+        the tree/year/GSTR it was scanned with, how many docs are already done, and
+        whether the original PDF tree is still where it was.
+
+        ``gstr`` prefers the path recorded in meta but falls back to the kept copy
+        inside the run dir (``detect._keep_gstr_with_run``), so a *copied* run folder
+        still finds its workbook. ``tree_exists`` is False when the PDF tree has moved:
+        the skip-list keys on absolute ``source_key`` paths, so a moved tree would
+        silently reprocess everything — the caller warns instead of pretending it
+        appended.
+        """
+        meta = self.read_meta()
+        root = meta.get("root")
+        gstr = meta.get("gstr_path")
+        if gstr and not Path(gstr).exists():
+            local = self.dir / Path(gstr).name
+            gstr = str(local) if local.exists() else None
+        return {
+            "dir": str(self.dir),
+            "run_id": self.run_id,
+            "root": root,
+            "fy": meta.get("fy"),
+            "gstr": gstr,
+            "complete": bool(meta.get("complete")),
+            "done": len(self.done_keys()),
+            "tree_exists": bool(root) and Path(root).exists(),
+        }
+
     @classmethod
     def find_resumable(cls, out_root: Path, root: str,
                        fy: str | None = None) -> Optional["RunStore"]:
@@ -232,3 +261,21 @@ class RunStore:
                     and (run_dir / "checkpoint.jsonl").exists():
                 return cls(run_dir)
         return None
+
+    @classmethod
+    def open_existing(cls, run_dir: Path | str) -> "RunStore":
+        """Open a specific, already-written run directory — the "continue a saved
+        run" entry point (the user points at a run folder to append newly-added PDFs).
+
+        Unlike ``find_resumable`` this ignores ``complete``: continuing a *finished*
+        run is the whole point, and passing the store explicitly to ``run_scan``
+        bypasses the completeness gate. Validate up front so a wrong folder fails here
+        with a clear message instead of as a mysterious empty scan.
+        """
+        d = Path(run_dir).expanduser()
+        if not d.is_dir():
+            raise ValueError(f"not a folder: {d}")
+        if not (d / "run_meta.json").exists() or not (d / "checkpoint.jsonl").exists():
+            raise ValueError(
+                f"{d} is not a run folder (needs run_meta.json + checkpoint.jsonl)")
+        return cls(d)

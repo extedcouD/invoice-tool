@@ -68,7 +68,7 @@
   @keyframes spin{to{transform:rotate(360deg)}}
   /* a spinner that sits inside a button while its action is in flight */
   .spin.sm{width:11px;height:11px;border-width:2px;vertical-align:-1px;margin-right:4px}
-  /* blocking overlay for the long jobs (export / Drive upload) */
+  /* blocking overlay for the long job (the export) */
   #busy-ov{display:none;position:fixed;inset:0;z-index:50;background:rgba(8,10,14,.72);
     align-items:center;justify-content:center}
   #busy-ov .box{background:var(--panel);border:1px solid var(--line);border-radius:12px;
@@ -184,11 +184,10 @@
 </script>
 {% endif %}
 
-<!-- Blocking progress overlay for the long post-scan jobs (export / Drive upload).
-     These take minutes on a Drive run — one network round-trip per invoice — and
-     running them inside the POST with no feedback was indistinguishable from the
-     app being broken: you clicked, nothing happened, and everything else you
-     clicked queued behind it. -->
+<!-- Blocking progress overlay for the long post-scan job (the export). It copies
+     every matched invoice and rewrites the workbook, and running it inside the POST
+     with no feedback was indistinguishable from the app being broken: you clicked,
+     nothing happened, and everything else you clicked queued behind it. -->
 <div id="busy-ov">
   <div class="box">
     <div class="flex" style="gap:12px;align-items:center">
@@ -206,9 +205,9 @@
 
 <script>
 // ---- shared UI helpers ----------------------------------------------------
-// Every mutating action in this app can be slow (a Drive run makes each one a
-// network call), so nothing may look inert after a click: buttons go busy, long
-// jobs get a real progress bar.
+// Every mutating action in this app can be slow (the export copies every matched
+// invoice), so nothing may look inert after a click: buttons go busy, long jobs get
+// a real progress bar.
 window.UI = (function(){
   const $ = id => document.getElementById(id);
   const ov = $("busy-ov");

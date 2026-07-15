@@ -8,7 +8,7 @@ so an extra/missing folder level doesn't derail the whole record.
 It is a **generator**, and it checks in with the :class:`RunControl` as it goes:
 the pipeline pulls documents from it lazily, so the first PDF is processed while
 the rest of the tree is still being enumerated, and Stop works *during* discovery
-(on a 120 GB Drive tree that phase alone runs for minutes).
+(on a 120 GB tree that phase alone runs for minutes).
 """
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ def keep_fy_dir(name: str, fy_scope: str | None) -> bool:
 
     Keyed on the *shape* (RE_FY) at any depth rather than on a fixed depth, so a
     tree that nests its years still prunes correctly and a tree with no FY level is
-    left alone. Shared by both walkers so local and Drive can't drift apart.
+    left alone.
     """
     if not fy_scope or not RE_FY.match(name):
         return True
@@ -109,11 +109,7 @@ def list_fy_folders(root: Path | str) -> list[str]:
 
 def seed_document(source_key: str, path: str, filename: str, size_bytes: int,
                   info: PathInfo, **extra) -> Document:
-    """Build the seed Document + its discovery event and path flags.
-
-    Shared by the local and Drive walkers so the two can't drift apart in what
-    they flag.
-    """
+    """Build the seed Document + its discovery event and path flags."""
     doc = Document(
         id=doc_id_for(source_key),
         path=path,

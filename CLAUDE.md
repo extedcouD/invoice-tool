@@ -10,10 +10,9 @@ links each to its company + id, extracts a Phase-1 field subset, and writes a ma
 with a Flask review app for low-confidence cases. Scope is deliberately narrow: **detect +
 link only**. No line-item parsing, no financial analysis, bank scope hard-coded to Kotak.
 
-The default source is a **local** folder, but the desktop app can also read the tree
-**directly from Google Drive** and publish results back to a new Drive folder (see the
-FileSource seam + `io/drive.py` below). Large scans **checkpoint and resume**, so a run over a
-120 GB Drive tree survives interruption.
+The source is a **local** folder tree (abstracted behind the `FileSource` seam, kept as a
+single local implementation). Large scans **checkpoint and resume**, so a run over a 120 GB
+tree survives interruption, and a finished run can be **continued** to append newly-added PDFs.
 
 ## Commands
 
@@ -83,18 +82,15 @@ Key structural facts (each requires reading several files to reconstruct):
   labels each path component by regex (not fixed depth), and **yields** seed `Document`s.
   `Pipeline.run` *pulls* from it with a bounded window of in-flight work, so discovery and
   processing overlap: the first PDF is processed while the tree is still being enumerated.
-  Both walkers take a `RunControl` and `gate()` per directory / per Drive `files.list` page —
-  without that, Stop was a literal no-op for the minutes a 120 GB Drive walk takes.
-- **A run is scoped to one financial year, and the walkers *prune* rather than filter**
-  (`Settings.fy_scope` → `keep_fy_dir`, shared by both walkers so they can't drift). `--root`
-  stays the **tree** root even for a one-year run: re-rooting at the FY folder — the obvious
-  shortcut — drops the FY component from the walk-relative path, so `_parse_path` sets no
-  `info.fy` and **every** doc comes out flagged `path_incomplete` (a 100%-flagged review queue
-  and a blank `fy` column). Locally the prune is an in-place `dirnames[:]` edit that must sit
-  *above* the bank gate, which `continue`s for the root dir — the one dir where the FY folders
-  are visible. On Drive it must reach `walk_pdf_tree`'s `descend` predicate: `walk_drive`'s
-  scope gate runs *after* the listing, so on its own it only prevents downloads, and we'd still
-  pay one `files.list` round-trip per folder of every other year. Year names are matched through
+  `walk()` takes a `RunControl` and `gate()`s per directory — without that, Stop was a literal
+  no-op for the minutes a 120 GB walk takes.
+- **A run is scoped to one financial year, and the walk *prunes* rather than filters**
+  (`Settings.fy_scope` → `keep_fy_dir`). `--root` stays the **tree** root even for a one-year
+  run: re-rooting at the FY folder — the obvious shortcut — drops the FY component from the
+  walk-relative path, so `_parse_path` sets no `info.fy` and **every** doc comes out flagged
+  `path_incomplete` (a 100%-flagged review queue and a blank `fy` column). The prune is an
+  in-place `dirnames[:]` edit that must sit *above* the bank gate, which `continue`s for the
+  root dir — the one dir where the FY folders are visible. Year names are matched through
   `norm_fy` (`RE_FY` accepts `FY22-23` and `fy 22 - 23`) — an exact `==` would silently prune the
   whole tree and "succeed" with zero invoices, which looks exactly like a broken tool.
 - **`Document.id` is a stable hash of `source_key`**, not a walk index. An index-based id is
@@ -107,9 +103,9 @@ Key structural facts (each requires reading several files to reconstruct):
 - **Where the bytes come from is abstracted (`FileSource`, `core/interfaces.py`).** `walk()`
   seeds Documents for local paths; `extract` (`io/pdf.py`) calls `FileSource.materialize(doc)`
   to get a *local* path before `fitz.open`, so OCR/parse never know the source. `LocalFileSource`
-  (`io/sources.py`) is a passthrough; `DriveFileSource` (`io/drive.py`) downloads each PDF to a
-  temp file. To scan Drive, `run_scan` takes a `walker=walk_drive` + `file_source=DriveFileSource`
-  — the pipeline is otherwise unchanged.
+  (`io/sources.py`) is the only implementation (a passthrough of `doc.path`). The seam — plus the
+  pluggable `walker`/`file_source` params on `run_scan` — is kept so a future remote source could
+  slot in without touching the pipeline; it does **not** currently support anything but local.
 - **Linking is pipeline state, not just an output format** (`io/gstr.py`). It is split in three:
   `read_b2b_rows` (parse the return once) → **`match`** (pure, in-memory, no I/O) →
   `write_linked` (copy PDFs + write `<stem>_linked.xlsx`). Because `match` is pure it is cheap
@@ -135,8 +131,9 @@ Key structural facts (each requires reading several files to reconstruct):
   `partial_token_set_ratio`, which returns 100 as soon as any single word overlaps, and every
   PDF in a tree shares words like "2022" — it scored an unrelated Zephyr invoice 85 for the
   query "apex aug 003".
-- **`write_linked` pulls bytes through the `FileSource`.** On a Drive run `doc.path` is a
-  display string, not a file — a plain `shutil.copy2(doc.path)` fails for every matched row.
+- **`write_linked` pulls bytes through the `FileSource`, not `doc.path` directly** — keeping
+  the copy path source-agnostic through the one abstraction that would let a non-local source
+  slot in.
 - **Scans are resumable, and `RunResult.complete` is the one fact that decides it.** Each
   finished doc is appended to `checkpoint.jsonl` immediately; `run_meta.json` marks a run
   complete. `RunStore.find_resumable()` reopens an interrupted run for the same input, and
@@ -153,6 +150,18 @@ Key structural facts (each requires reading several files to reconstruct):
   `PathIndex`) and so has to stay a real path. In the app, `run_state().last_input.fy` is
   load-bearing for the same reason Resume exists at all: Resume POSTs `last_input` **verbatim**,
   so dropping the year there restarts a one-year run as an unscoped rescan of the whole tree.
+  **Appending new PDFs to a *finished* run reuses this same skip-then-reassemble machinery** —
+  it is not a separate code path. `find_resumable()` deliberately refuses a `complete` run, so
+  "continue" instead opens the run dir *explicitly* (`RunStore.open_existing`) and passes it as
+  `run_scan(store=…)`, which bypasses the completeness gate; the pipeline skips every
+  already-checkpointed `source_key`, only new files are processed, and `checkpoint_docs()` +
+  `write_master` rewrite `detections.json`/master/`_linked.xlsx` **in place**. Root/fy/gstr come
+  from the run's own `run_meta.json` (`RunStore.describe()`) — never re-typed — so a *copied* run
+  folder is self-describing (the GSTR copy travels inside it). The one hazard is that
+  `source_key` is an absolute path: if the PDF *tree* moved, nothing matches and everything
+  reprocesses, so `describe().tree_exists` gates the UI. Surfaces are `scan --continue-run RUNDIR`
+  and the setup form's third source mode "Continue a saved run" (`source_mode="continue"`, local
+  only for now).
 - **Pause/stop state is *pulled*, never pushed** (`RunController.status()`). `status.json` is
   only rewritten when a document completes, and pausing stops documents completing — so a
   pushed `paused` flag froze at `false` forever and Resume became unreachable. `status()` reads
@@ -173,31 +182,26 @@ Key structural facts (each requires reading several files to reconstruct):
   pause/stop onto every page, and all page state is rehydrated from `run_state()`. Review is
   deliberately **read-only until the scan lands** (`_locked()` in `web/app.py`) — `run_scan`
   rebuilds `detections.json` from the checkpoint at the end, so a mid-scan edit would be lost.
-  The setup screen also offers a **Google Drive** source: "Connect Google Drive"
-  (`/api/drive/auth` → `RunController.authenticate_drive`, installed-app OAuth), a folder
-  link/id, and an output-folder name; on finish, `/api/drive/upload` publishes the master +
-  detected invoices to a new Drive folder (invoices via server-side `files.copy` — originals are
-  never modified). OAuth needs a user-supplied `client_secret.json` in the app-support dir
-  (`io/drive.app_support_dir()`); the frozen bundle can be smoke-tested with `--selftest`.
-- **Nothing slow may run inside a request.** The two long post-scan jobs — "Finish & export"
-  (`/finish`) and the Drive upload (`/api/drive/upload`) — are *per-invoice network work*:
-  `write_linked` pulls every matched PDF's bytes through the `FileSource`, and the upload does
-  one `files.copy` each. Run inline they took **minutes** on a Drive run with the window frozen
-  and no progress, so the user concluded the buttons were dead — and because the route held the
-  app write-lock, every review edit queued behind them too. They now go through
-  `RunController.start_task()` on a thread, publish `{done,total}`, and the page polls
-  `/api/task` behind a progress overlay. `write_linked` fetches in a `ThreadPoolExecutor` (it is
-  network-bound) but writes every openpyxl cell on the calling thread — hence its three passes:
-  decide rows → fetch in parallel → stamp cells. `_locked()` covers a running task as well as a
-  running scan, because the export reads `result` while writing.
+  The setup screen's second source mode is **"Continue a saved run"** (`source_mode="continue"`):
+  pick a previous run folder and the runner reads its root/fy/gstr from `run_meta.json`
+  (`/api/run/inspect` → `RunStore.describe`) and appends newly-added PDFs into it (see the
+  resumable-scans bullet).
+- **Nothing slow may run inside a request.** The one long post-scan job — "Finish & export"
+  (`/finish`) — copies every matched PDF's bytes through the `FileSource` and rewrites the
+  workbook cell by cell. Run inline it froze the window with no progress, so the user concluded
+  the button was dead — and because the route held the app write-lock, every review edit queued
+  behind it too. It now goes through `RunController.start_task()` on a thread, publishes
+  `{done,total}`, and the page polls `/api/task` behind a progress overlay. `write_linked`
+  fetches in a `ThreadPoolExecutor` but writes every openpyxl cell on the calling thread — hence
+  its three passes: decide rows → fetch in parallel → stamp cells. `_locked()` covers a running
+  task as well as a running scan, because the export reads `result` while writing.
 - **A review edit must not rewrite the corpus.** `_persist` saves `detections.json` only, *not*
   the master workbook: `write_master` is O(corpus) (~1s per 20k docs in openpyxl), and paying
   that on every bind/approve click is what made them feel broken. `/finish` and `/export` write
   the master from that same result.
-- **The GSTR-2A workbook's *name* is load-bearing.** The export is `<stem>_linked.xlsx` after it
-  and it is the copy kept in the run dir, so `download_workbook_to_temp` downloads into a temp
-  *directory* under the real Drive name — a bare `mkstemp` shipped the user
-  `tmpnpkuwvev_linked.xlsx` as their deliverable.
+- **The GSTR-2A workbook's *name* is load-bearing.** The export is `<stem>_linked.xlsx` after
+  it, and the copy kept beside the run (`_keep_gstr_with_run`) preserves the original name — a
+  temp-named copy would ship `tmpnpkuwvev_linked.xlsx` as the user's deliverable.
 - **Fault isolation.** `Pipeline.run_one` wraps each stage in try/except: a failure flags
   `stage_error` on that one doc and the run continues. Never let a stage crash the whole run.
 - **`workers > 1` uses a `ThreadPoolExecutor`, not processes.** OCR shells out to the
@@ -220,9 +224,14 @@ Key structural facts (each requires reading several files to reconstruct):
 - **Add/reorder a pipeline step** → implement `Stage` (unique `name`, `process(doc)->doc`) and
   wire it into `build_pipeline` in `detect.py`.
 - **Scope a run to one financial year** → `Settings.fy_scope` (`config.py`) + `keep_fy_dir` /
-  `norm_fy` / `list_fy_folders` (`stages/walk.py`), used by *both* walkers. Pure, so
-  `tests/test_scope.py` asserts the prune (and that the other year is never even listed on
-  Drive) with no scan and no network.
+  `norm_fy` / `list_fy_folders` (`stages/walk.py`). Pure, so `tests/test_scope.py` asserts the
+  prune (the other year's subtree is never descended) with no scan.
+- **Continue/append newly-added PDFs to a finished run** → `RunStore.open_existing` +
+  `describe` (`io/runstore.py`), the `--continue-run` branch in `cli.py::cmd_scan`, the
+  `source_mode == "continue"` branch in `web/runner.py::start`, and `/api/run/inspect`
+  (`web/app.py`) backing the setup form's third source mode. The scan itself is unchanged —
+  it's the existing `run_scan(store=…)` skip-list path. `tests/test_runstore_continue.py`
+  asserts `open_existing`/`describe` on a synthetic run dir (no scan).
 - **Change how a B2B row is matched to a PDF** → `io/gstr.py::_resolve` / `_pick_best` (keys and
   tie-breaks) and `suggest` (the candidates offered when a human has to resolve a row by hand).
   `match` is pure, so `tests/test_linking.py` asserts outcomes directly — no scan needed.

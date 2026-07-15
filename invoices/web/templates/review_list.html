@@ -171,9 +171,9 @@
 {% endif %}
 
 <script>
-// Finish & export is the longest thing the app does — on a Drive run it downloads
-// every matched invoice. It runs as a background task with a progress bar rather
-// than a POST that freezes the window for minutes.
+// Finish & export is the longest thing the app does — it copies every matched
+// invoice and rewrites the workbook. It runs as a background task with a progress
+// bar rather than a POST that freezes the window.
 (function(){
   const b = document.getElementById("finish-btn");
   if(!b) return;

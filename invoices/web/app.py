@@ -188,15 +188,13 @@ def create_app(controller: RunController) -> Flask:
         invoice = (data.get("invoice") or "").strip()
         gstr = (data.get("gstr") or "").strip() or None
         source_mode = (data.get("source_mode") or "local").strip()
-        upload_folder = (data.get("upload_folder") or "").strip() or None
         fy = (data.get("fy") or "").strip() or None     # "" = All years
         if not invoice:
-            where = ("Google Drive folder" if source_mode == "drive"
+            where = ("saved run folder" if source_mode == "continue"
                      else "invoice folder")
             return jsonify({"ok": False, "error": f"Choose the {where} first."}), 400
         partial_cache["size"] = -1          # a new run invalidates the cached ledger
-        res = controller.start(invoice, gstr, source_mode=source_mode,
-                               upload_folder_name=upload_folder, fy=fy)
+        res = controller.start(invoice, gstr, source_mode=source_mode, fy=fy)
         return jsonify(res), (200 if res.get("ok") else 400)
 
     @app.route("/api/years")
@@ -205,25 +203,29 @@ def create_app(controller: RunController) -> Flask:
 
         The client's returns arrive one workbook per financial year, so a run is
         scoped to one year; "All years" ("") still walks the whole tree. Only the
-        server can see the tree — local *or* Drive — so the list comes from here.
+        server can see the tree, so the list comes from here.
         """
         root = (request.args.get("root") or "").strip()
-        mode = (request.args.get("source_mode") or "local").strip()
         if not root:
             return jsonify({"ok": True, "years": []})
-        if mode == "drive":
-            if controller.drive is None:
-                return jsonify({"ok": False, "years": [],
-                                "error": "Connect Google Drive first."}), 400
-            from ..io.drive import folder_id_from
-            try:
-                years = controller.drive.list_fy_folders(folder_id_from(root))
-            except Exception as exc:
-                return jsonify({"ok": False, "years": [], "error": str(exc)}), 400
-            return jsonify({"ok": True, "years": years})
         from ..stages.walk import list_fy_folders
         return jsonify({"ok": True,
                         "years": list_fy_folders(Path(root).expanduser())})
+
+    @app.route("/api/run/inspect")
+    def api_run_inspect():
+        """Summarize a saved run folder for the "Continue a saved run" source mode:
+        the tree/year/GSTR it was scanned with, how many docs are already done, and
+        whether the original tree is still in place. Backs the form's detected panel.
+        """
+        d = (request.args.get("dir") or "").strip()
+        if not d:
+            return jsonify({"ok": False, "error": "Pick a run folder."}), 400
+        try:
+            store = RunStore.open_existing(d)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return jsonify({"ok": True, **store.describe()})
 
     @app.route("/api/pause", methods=["POST"])
     def api_pause():
@@ -240,29 +242,6 @@ def create_app(controller: RunController) -> Flask:
         """Stop the scan. Safe: the run stays resumable from its checkpoint."""
         res = controller.stop()
         return jsonify(res), (200 if res.get("ok") else 400)
-
-    @app.route("/api/drive/auth", methods=["POST"])
-    def api_drive_auth():
-        """Sign in to Google Drive (opens the system browser for consent)."""
-        res = controller.authenticate_drive()
-        return jsonify(res), (200 if res.get("ok") else 400)
-
-    @app.route("/api/drive/upload", methods=["POST"])
-    def api_drive_upload():
-        """Publish the master + detected invoices to a new Drive folder.
-
-        Backgrounded: it is one Drive round-trip per invoice, so on a real run this
-        takes minutes. The page polls /api/task for progress.
-        """
-        def job(progress) -> None:
-            rep = controller.upload_results(on_progress=progress)
-            # upload_results reports failure by returning, not raising — surface it as
-            # a failed task, or the UI would call a failed upload "done".
-            if not rep.get("ok"):
-                raise RuntimeError(rep.get("error") or "Upload failed.")
-
-        res = controller.start_task("upload", job)
-        return jsonify(res), (200 if res.get("ok") else 409)
 
     @app.route("/api/docs")
     def api_docs():
@@ -320,8 +299,8 @@ def create_app(controller: RunController) -> Flask:
         """Serve a document's PDF, fetching it on demand if it wasn't pre-copied.
 
         The on-demand path is what lets a *stopped* run skip the bulk pre-copy of
-        flagged PDFs (the longest part of the shutdown on Drive) without costing
-        the reviewer anything.
+        flagged PDFs (the longest part of the shutdown) without costing the reviewer
+        anything.
         """
         d = doc_by_id(doc_id)
         if not d:
@@ -355,7 +334,7 @@ def create_app(controller: RunController) -> Flask:
         index_cache["gen"] += 1
 
     def _locked() -> bool:
-        """Review is read-only while a scan — or a long export/upload — is running.
+        """Review is read-only while a scan — or a long export — is running.
 
         Mid-scan you are looking at the live checkpoint, and `run_scan` rebuilds
         detections.json from that checkpoint when it finishes — so an edit made now
@@ -466,10 +445,11 @@ def create_app(controller: RunController) -> Flask:
     def finish():
         """Kick off the export on a background thread; the page polls /api/task.
 
-        This used to run inline. On a Drive run it downloads every matched invoice,
-        so the request could take *minutes* — the window sat frozen with no progress,
-        the user assumed nothing had happened, and every review edit blocked behind
-        the same write lock. Now it returns immediately and reports progress.
+        This used to run inline. write_linked copies every matched invoice and
+        rewrites the workbook, so the request could take seconds — the window sat
+        frozen with no progress, the user assumed nothing had happened, and every
+        review edit blocked behind the same write lock. Now it returns immediately
+        and reports progress.
         """
         r = result()
         if r is None or controller.store is None:
@@ -508,7 +488,7 @@ def create_app(controller: RunController) -> Flask:
 
     @app.route("/api/task")
     def api_task():
-        """Progress of the current long job (export / Drive upload)."""
+        """Progress of the current long job (the export)."""
         return jsonify(controller.task_state())
 
     @app.route("/api/open_output", methods=["POST"])
@@ -567,7 +547,7 @@ def serve(store: RunStore, port: int = 5000, open_browser: bool = True) -> None:
     controller.fy = store.fy()
     controller.last_input = {
         "invoice": meta.get("root", ""), "gstr": str(controller.gstr_path or ""),
-        "source_mode": "local", "upload_folder": "", "fy": controller.fy or "",
+        "source_mode": "local", "fy": controller.fy or "",
     }
 
     app = create_app(controller)

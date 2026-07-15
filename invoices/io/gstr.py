@@ -21,8 +21,8 @@ modified; a new `<stem>_linked.xlsx` is written into the run dir.
                    to "Finish & export" so it reflects human corrections.
 
 Only ``write_linked`` touches the disk, and it pulls bytes through a
-:class:`FileSource`, so a Drive-hosted invoice is downloaded rather than assumed
-to exist at ``doc.path`` (on a Drive run ``doc.path`` is a display string, not a file).
+:class:`FileSource` rather than assuming they sit at ``doc.path`` — keeping the
+copy path source-agnostic.
 """
 from __future__ import annotations
 
@@ -397,9 +397,9 @@ def write_linked(result: RunResult, plan: LinkPlan, gstr_path: Path, store: RunS
     """Materialize ``plan``: copy the matched PDFs and write ``<stem>_linked.xlsx``.
 
     ``on_progress(done, total)`` is called as the PDFs land. This is the expensive
-    half of linking — on a Drive run every matched row is a network download — so the
-    caller runs it on a background thread and shows a real progress bar rather than
-    freezing the window for minutes with no sign of life.
+    half of linking — it copies every matched invoice and rewrites the workbook — so
+    the caller runs it on a background thread and shows a real progress bar rather than
+    freezing the window with no sign of life.
     """
     gstr_path = Path(gstr_path)
     file_source = file_source or LocalFileSource()
@@ -461,12 +461,10 @@ def write_linked(result: RunResult, plan: LinkPlan, gstr_path: Path, store: RunS
         to_copy.append((rm, doc, name))
 
     # ---- pass 2: fetch the bytes, in PARALLEL.
-    # Bytes come through the FileSource: on a Drive run doc.path is a display string,
-    # not a file, so a plain shutil.copy2(doc.path) would fail for every matched row —
-    # and each materialize() is a network download. Serially that was the single
-    # longest thing the app ever did (hundreds of sequential downloads over a slow
-    # link, inside one request, with the UI frozen and no progress). It is network-
-    # bound, so threads give real parallelism, and we report progress as they land.
+    # Bytes come through the FileSource (kept source-agnostic) rather than reading
+    # doc.path directly. Copying every matched invoice was the single longest thing
+    # the app did inside one request, with the UI frozen and no progress. We fan the
+    # copies out across threads and report progress as they land.
     def _fetch(item) -> tuple:
         rm, doc, name = item
         try:

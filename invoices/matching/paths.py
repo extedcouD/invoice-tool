@@ -30,8 +30,6 @@ from rapidfuzz import fuzz, process
 
 from ..core.models import Document
 
-DRIVE_PREFIX = "drive://"
-
 # Below this a document is noise, not a near-miss. It is a *mean* over the query's
 # tokens (a token the document doesn't have scores 0), so 62 means "most of what
 # you typed is in this path".
@@ -50,14 +48,11 @@ SHORT_TOKEN = 2
 def rel_parts(doc: Document, root: str | None = None) -> list[str]:
     """The doc's path relative to the scan root, as folder components + filename.
 
-    Handles both sources: a local run stores an absolute path, a Drive run stores
-    a ``drive://a/b/c.pdf`` display string that is *already* root-relative. Falls
-    back to the raw parts if the path doesn't sit under ``root`` (a run reopened
-    from a moved folder, say) — a degraded breadcrumb beats an exception.
+    A local run stores an absolute path. Falls back to the raw parts if the path
+    doesn't sit under ``root`` (a run reopened from a moved folder, say) — a degraded
+    breadcrumb beats an exception.
     """
     p = doc.path or doc.filename
-    if p.startswith(DRIVE_PREFIX):
-        return [x for x in p[len(DRIVE_PREFIX):].split("/") if x]
     path = Path(p)
     if root:
         for base in (Path(root), Path(root).resolve()):

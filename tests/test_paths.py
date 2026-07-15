@@ -48,13 +48,9 @@ def index() -> PathIndex:
 
 
 # ---- relative paths ------------------------------------------------------
-def test_rel_parts_local_and_drive():
+def test_rel_parts_relative_to_root():
     assert rel_parts(TREE[3], ROOT) == [
         "Zephyr Logistics", "2022-23", "Aug-2022", "15-08-2022", "ZEP-8891.pdf"]
-
-    # A Drive run stores a display string that is already root-relative.
-    d = Document(id="x", path="drive://Apex/Aug-2022/A-1.pdf", filename="A-1.pdf")
-    assert rel_parts(d, ROOT) == ["Apex", "Aug-2022", "A-1.pdf"]
 
 
 def test_rel_parts_survives_a_path_outside_the_root():

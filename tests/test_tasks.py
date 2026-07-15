@@ -1,9 +1,9 @@
-"""The long post-scan jobs (export / Drive upload) must never block the request.
+"""The long post-scan job (the export) must never block the request.
 
-On a Drive run each matched invoice is a network download and each uploaded one a
-Drive round-trip, so run inline these took *minutes* with the window frozen and no
-progress — you clicked Finish, nothing happened, and every review edit queued behind
-the same write lock. They now run on a thread and publish progress.
+Copying every matched invoice and rewriting the workbook run inline took *seconds*
+with the window frozen and no progress — you clicked Finish, nothing happened, and
+every review edit queued behind the same write lock. It now runs on a thread and
+publishes progress.
 """
 from __future__ import annotations
 
@@ -30,7 +30,8 @@ def _inv(doc_id: str, number: str, gstin: str) -> Document:
 
 
 class SlowSource(FileSource):
-    """Stands in for Drive: every materialize() is a slow network round-trip."""
+    """A slow FileSource: every materialize() sleeps, to prove the copies run
+    in parallel through the seam rather than one at a time."""
 
     def __init__(self, pdf, delay=0.15):
         self.pdf, self.delay = pdf, delay
@@ -98,10 +99,8 @@ def test_write_linked_reports_progress_and_fetches_in_parallel(linked_env):
 
 
 def test_the_export_keeps_the_workbooks_real_name(linked_env):
-    """`<stem>_linked.xlsx` is named after the return, so the return's name matters.
-
-    On a Drive run the workbook arrives as a temp download; naming that temp file
-    `tmpXXXX.xlsx` produced `tmpnpkuwvev_linked.xlsx` as the user's deliverable.
+    """`<stem>_linked.xlsx` is named after the return, so the return's name matters —
+    a temp-named workbook would ship `tmpnpkuwvev_linked.xlsx` as the deliverable.
     """
     store, result, plan, gstr, pdf = linked_env
     rep = write_linked(result, plan, gstr, store, file_source=SlowSource(pdf, delay=0))
