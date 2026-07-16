@@ -256,7 +256,8 @@ def link_now(result: RunResult, gstr_path: Path, store: RunStore,
     gstr_path = _keep_gstr_with_run(Path(gstr_path), store)
     rows = read_b2b_rows(gstr_path)
     plan = match(rows, result.invoices(), store.manual_links(),
-                 skipped=store.skipped_suppliers())
+                 skipped=store.skipped_suppliers(),
+                 not_found_rows=store.manual_not_found())
     apply_plan(result, plan)
     store.save_link(plan)
     return plan

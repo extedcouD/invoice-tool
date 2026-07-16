@@ -2,7 +2,13 @@
 {% import "_macros.html" as m %}
 {% block title %}B2B row {{ rm.row }} — find PDF{% endblock %}
 {% block body %}
-<p><a href="{{ url_for('review', tab='rows') }}">← back to unmatched rows</a></p>
+<div class="flex" style="justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+  <p style="margin:0"><a href="{{ url_for('review', tab='rows') }}">← back to unmatched rows</a></p>
+  {% if next_row %}
+  <a class="btn ghost sm" href="{{ url_for('link_row', row=next_row) }}"
+     title="Skip this row and move on to the next unresolved one">Skip to next unresolved row →</a>
+  {% endif %}
+</div>
 
 <h1>
   {% if rm.status == 'ambiguous' %}Pick the right invoice for B2B row {{ rm.row }}
@@ -28,7 +34,8 @@
   <div style="margin-top:12px">
     <span class="pill ok">bound by hand</span>
     <form method="post" action="{{ url_for('bind_row', row=rm.row) }}"
-          style="display:inline" data-busy="Undoing…">
+          style="display:inline" data-busy="Undoing…"
+          onsubmit="return confirm('Undo this binding? The row goes back into the unmatched queue.')">
       <button class="btn ghost sm" type="submit">Undo this binding</button>
     </form>
   </div>

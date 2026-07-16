@@ -26,6 +26,8 @@
   .grid{display:grid;gap:14px}
   .cards{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .card.recent-run{transition:border-color .15s}
+  .card.recent-run:hover{border-color:var(--accent)}
   .card .k{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
   .card .v{font-size:26px;font-weight:700;margin-top:4px}
   table{width:100%;border-collapse:collapse;background:var(--panel);
@@ -54,6 +56,11 @@
      "Browse folders…" — give it an amber cast so the two never read as the same. */
   .btn.skip-supplier{border-color:rgba(232,161,60,.55);color:var(--warn);background:rgba(232,161,60,.08)}
   .btn.skip-supplier:hover{border-color:var(--warn);background:rgba(232,161,60,.16)}
+  /* The one irreversible action in the app (rewrites the workbook, copies every
+     matched PDF) must not read as just another primary button — same reasoning as
+     .btn.skip-supplier above, reusing the same --warn token rather than a new color. */
+  .btn.finish{background:var(--warn);color:#2b1400}
+  .btn.finish:hover{background:#f0ac4c}
   .btn:disabled{opacity:.5;cursor:not-allowed}
   .btn.big{padding:11px 20px;font-size:14px}
   .btn.sm{padding:5px 10px;font-size:12px}
@@ -119,15 +126,16 @@
   /* an editable field with a copy button that grabs its live value */
   .field-copy{display:flex;gap:4px;align-items:stretch}
   .field-copy input{flex:1;min-width:0}
-  /* inline row-resolver on the rows tab */
-  /* extra vertical padding keeps the supplier-level "Skip this supplier" button
-     clearly apart from the row-level "Browse folders…" button directly below it. */
+  /* grouped rows tab: a supplier header, with its unmatched rows nested beneath.
+     Extra vertical padding sets the supplier header apart from its rows. */
   .grouphead>td{background:var(--panel2);border-top:2px solid var(--line);
     padding-top:13px;padding-bottom:13px}
-  .rowtoggle{cursor:pointer}
-  .rowtoggle .caret{display:inline-block;transition:transform .15s;color:var(--mut);width:12px}
-  .rowtoggle.open .caret{transform:rotate(90deg)}
-  .resolver>td{background:var(--panel2);padding:12px 16px}
+  /* the rows under a supplier are indented + carry a faint left rail, so they read
+     as children of the supplier header directly above them. The whole row is a link
+     to that row's "Find PDF" picker, so it takes a pointer + a hover-lit rail. */
+  tr.datarow{cursor:pointer}
+  tr.datarow>td:first-child{padding-left:30px;box-shadow:inset 3px 0 0 var(--line)}
+  tr.datarow:hover>td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
   /* right-side PDF preview drawer + its backdrop */
   #pdf-back{position:fixed;inset:0;z-index:59;background:rgba(8,10,14,.45)}
   #pdf-drawer{position:fixed;top:0;right:0;bottom:0;width:min(52vw,720px);z-index:60;
@@ -249,6 +257,22 @@
   </div>
 </div>
 
+<!-- A heavier confirmation than a plain confirm() — for the one genuinely
+     irreversible action in the app, so it can show what's actually about to happen
+     instead of a generic "are you sure?". Driven by UI.confirmModal(). -->
+<div id="confirm-ov" style="display:none;position:fixed;inset:0;z-index:55;
+     background:rgba(8,10,14,.72);align-items:center;justify-content:center">
+  <div class="box" style="background:var(--panel);border:1px solid var(--line);
+       border-radius:12px;padding:20px 22px;width:min(480px,90vw)">
+    <b id="co-title" style="font-size:15px"></b>
+    <div id="co-body" class="muted" style="margin-top:10px;line-height:1.6"></div>
+    <div class="flex" style="gap:10px;justify-content:flex-end;margin-top:18px">
+      <button class="btn ghost sm" id="co-cancel" type="button">Cancel</button>
+      <button class="btn finish sm" id="co-ok" type="button"></button>
+    </div>
+  </div>
+</div>
+
 <!-- PDF preview drawer: confirm a candidate invoice visually without leaving the
      review queue. Reuses /pdf/<id>, which serves just the page for a page-invoice. -->
 <div id="pdf-back" hidden></div>
@@ -366,14 +390,40 @@ window.UI = (function(){
     if(b){ e.preventDefault(); openOutput(b); }
   });
 
-  return {busy, runTask, openOutput, armForms};
+  // A heavier confirm() — for the one truly irreversible action (Finish & export),
+  // which used to get the exact same plain browser confirm() as a reversible click
+  // like "skip this supplier". `body` may be HTML (e.g. real counts), not just text.
+  // Resolves true/false; never throws, so the caller can always `if(await ...)`.
+  const co = $("confirm-ov");
+  function confirmModal({title, body, okLabel}){
+    return new Promise(resolve => {
+      $("co-title").textContent = title || "Are you sure?";
+      $("co-body").innerHTML = body || "";
+      $("co-ok").textContent = okLabel || "Confirm";
+      co.style.display = "flex";
+      const done = ok => { co.style.display = "none"; cleanup(); resolve(ok); };
+      const onOk = () => done(true), onCancel = () => done(false);
+      const onKey = e => { if(e.key === "Escape") done(false); };
+      function cleanup(){
+        $("co-ok").removeEventListener("click", onOk);
+        $("co-cancel").removeEventListener("click", onCancel);
+        document.removeEventListener("keydown", onKey);
+      }
+      $("co-ok").addEventListener("click", onOk);
+      $("co-cancel").addEventListener("click", onCancel);
+      document.addEventListener("keydown", onKey);
+    });
+  }
+
+  return {busy, runTask, openOutput, armForms, confirmModal};
 })();
 </script>
 
 <script>
 // ---- clipboard + PDF preview + the shared candidate-row renderer -----------
-// One implementation of "here is a PDF you can bind", used by both the standalone
-// picker page (link_row) and the inline resolver on the review rows tab.
+// One implementation of "here is a PDF you can bind", used by the standalone
+// picker page (link_row) — its search, browse and near-miss tabs all render rows
+// through here, so a bind behaves identically wherever it is triggered.
 window.LINK = (function(){
   const esc = s => (s == null ? "" : String(s)).replace(/[&<>"']/g,
     c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));

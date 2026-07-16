@@ -7,12 +7,7 @@
   <div>
     <h1 style="margin:0 0 4px">Review</h1>
     {% if counts %}
-    <div class="muted">
-      Matched <b style="color:var(--ok)">{{ counts.matched }}</b> of {{ counts.total }} B2B rows
-      {% if counts.not_found %}· <b style="color:var(--bad)">{{ counts.not_found }}</b> with no PDF{% endif %}
-      {% if counts.ambiguous %}· <b style="color:var(--warn)">{{ counts.ambiguous }}</b> ambiguous{% endif %}
-      {% if counts.skipped %}· {{ counts.skipped }} skipped{% endif %}
-    </div>
+    <div id="review-summary">{{ m.review_summary(counts) }}</div>
     {% else %}
     <div class="muted">
       No GSTR-2A workbook was chosen for this run — detection only.
@@ -23,7 +18,7 @@
   <div class="flex" style="gap:10px;flex-wrap:wrap">
     <button class="btn ghost" type="button" data-open-output>📂 Open output folder</button>
     {% if not locked %}
-    <button class="btn big" type="button" id="finish-btn">Finish &amp; export →</button>
+    <button class="btn big finish" type="button" id="finish-btn">Finish &amp; export →</button>
     {% endif %}
   </div>
 </div>
@@ -35,16 +30,19 @@
 </div>
 {% endif %}
 
-{% if counts and counts.matched + counts.skipped == counts.total %}
-<div class="banner" style="margin-top:14px">
-  ✓ Every B2B row is matched or skipped. Nothing left to resolve.
+<div class="tabs" id="review-tabs">
+  <a href="?tab=rows" data-tab="rows" class="{{ 'on' if active_tab == 'rows' }}">Unmatched rows
+    <span class="n" id="rows-badge">{{ rows|length }}</span></a>
+  <a href="?tab=bound" data-tab="bound" class="{{ 'on' if active_tab == 'bound' }}">My bindings
+    <span class="n" id="bound-badge">{{ bound|length }}</span></a>
 </div>
-{% endif %}
-
 <div style="height:16px"></div>
 
-{# ---- B2B rows the scan could not find a PDF for --------------------------- #}
-{% if not plan %}
+{# ======================================================================= #}
+{# TAB 1 · B2B rows the scan could not find a PDF for                       #}
+{# ======================================================================= #}
+<div class="review-pane" data-pane="rows" {% if active_tab != 'rows' %}hidden{% endif %}>
+  {% if not plan %}
     <div class="card"><span class="pill info">no return</span>
       This run had no GSTR-2A workbook, so there are no B2B rows to match.</div>
   {% elif not rows %}
@@ -52,31 +50,19 @@
       Every B2B row in the return is matched or skipped.</div>
   {% else %}
     <p class="muted">These rows are in the return but no invoice PDF was found for them —
-       the list the client actually cares about. <b>Click a row</b> to bind a PDF without
-       leaving the page, or skip a whole supplier.</p>
+       the list the client actually cares about. <b>Click a row</b> to find and bind its
+       PDF, or skip a whole supplier.</p>
 
-    {% if skipped_suppliers %}
-    <div class="card" style="margin-bottom:12px">
-      <b>Skipped suppliers ({{ skipped_suppliers|length }})</b>
-      <span class="muted">— their unmatched rows export as <span class="mono">SKIPPED</span>.</span>
-      <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:8px">
-        {% for s in skipped_suppliers %}
-        <span class="pill info">{{ s }}{% if not locked %}
-          <a href="#" class="unskip" data-supplier="{{ s }}" title="un-skip"
-             style="margin-left:4px">✕</a>{% endif %}</span>
-        {% endfor %}
-      </div>
-    </div>
-    {% endif %}
+    <div id="skipped-card">{{ m.skipped_card(skipped_suppliers, locked) }}</div>
 
     <table id="rows-table">
-      <tr><th></th><th>row</th><th>supplier GSTIN</th><th>invoice no</th>
+      <tr><th>row</th><th>supplier GSTIN</th><th>invoice no</th>
           <th>invoice date</th><th>status</th><th></th></tr>
       {% for supplier, grp in rows|groupby('supplier') %}
         {% set grp = grp|list %}
-        <tr class="grouphead">
-          <td colspan="5"><b>{{ supplier or '— (no supplier name)' }}</b>
-             <span class="muted">· {{ grp|length }} row(s)</span></td>
+        <tr class="grouphead" data-supplier="{{ supplier }}">
+          <td colspan="4"><b>{{ supplier or '— (no supplier name)' }}</b>
+             <span class="muted">· <span class="grp-count">{{ grp|length }}</span> row(s)</span></td>
           <td colspan="2" class="right">
             {% if supplier and not locked %}
             <button class="btn ghost sm skip-supplier" type="button"
@@ -85,8 +71,8 @@
           </td>
         </tr>
         {% for r in grp %}
-        <tr class="rowtoggle" data-row="{{ r.row }}">
-          <td class="muted"><span class="caret">▶</span></td>
+        <tr class="datarow" data-supplier="{{ supplier }}" data-row="{{ r.row }}"
+            {% if not locked %}data-link="{{ url_for('link_row', row=r.row) }}"{% endif %}>
           <td class="mono muted">{{ r.row }}</td>
           <td class="mono">{{ r.gstin or '—' }}{{ m.copyable(r.gstin) }}</td>
           <td class="mono">{{ r.invoice_no or '—' }}{{ m.copyable(r.invoice_no) }}</td>
@@ -101,32 +87,48 @@
               <span class="pill info" title="already on the sheet">sheet: {{ r.existing_ref }}</span>
             {% endif %}
           </td>
-          <td class="right">
+          <td class="right" style="white-space:nowrap">
             {% if not locked %}
-            <a class="btn ghost sm" href="{{ url_for('link_row', row=r.row) }}"
-               onclick="event.stopPropagation()">Browse folders…</a>
+            <a class="btn ghost sm" href="{{ url_for('link_row', row=r.row) }}">Find PDF…</a>
+            <button class="btn ghost sm mark-nf" type="button" data-row="{{ r.row }}"
+                    title="I searched and there is no PDF for this row">Mark not found</button>
             {% endif %}
           </td>
-        </tr>
-        <tr class="resolver" data-for="{{ r.row }}" hidden>
-          <td colspan="7"><div class="cand" data-row="{{ r.row }}">
-            <span class="spin"></span> Loading candidates…</div></td>
         </tr>
         {% endfor %}
       {% endfor %}
     </table>
-{% endif %}
+  {% endif %}
+</div>
+
+{# ======================================================================= #}
+{# TAB 2 · rows a human bound by hand — reviewable + undoable               #}
+{# ======================================================================= #}
+<div class="review-pane" data-pane="bound" {% if active_tab != 'bound' %}hidden{% endif %}>
+  <div id="bound-content">{{ m.bound_pane(bound, locked) }}</div>
+</div>
 
 <script>
 // Finish & export is the longest thing the app does — it copies every matched
 // invoice and rewrites the workbook. It runs as a background task with a progress
-// bar rather than a POST that freezes the window.
+// bar rather than a POST that freezes the window. It's also the one irreversible
+// action on this page, so it gets the heavier modal (real counts, not a generic
+// "are you sure?") instead of the plain confirm() every other action here uses.
 (function(){
   const b = document.getElementById("finish-btn");
   if(!b) return;
-  b.onclick = () => {
-    const msg = "Write the final GSTR-linked workbook and matched-invoice folder now?";
-    if(!confirm(msg)) return;
+  const c = {{ (counts or {})|tojson }};
+  b.onclick = async () => {
+    const bits = [];
+    if(c.matched) bits.push(`<li><b>${c.matched}</b> matched invoice(s) will be copied into the export folder.</li>`);
+    if(c.not_found) bits.push(`<li><b>${c.not_found}</b> row(s) will be written <span class="mono">NOT FOUND</span> — still unresolved.</li>`);
+    if(c.ambiguous) bits.push(`<li><b>${c.ambiguous}</b> row(s) are ambiguous and will be written <span class="mono">NOT FOUND</span> too.</li>`);
+    if(c.skipped) bits.push(`<li><b>${c.skipped}</b> row(s) skipped by supplier.</li>`);
+    if(c.manual_not_found) bits.push(`<li><b>${c.manual_not_found}</b> row(s) confirmed missing by hand.</li>`);
+    const body = `This rewrites the GSTR-linked workbook and the matched-invoice folder.` +
+      (bits.length ? `<ul style="margin:8px 0 0;padding-left:18px">${bits.join("")}</ul>` : "");
+    const ok = await UI.confirmModal({title: "Write the final export now?", body, okLabel: "Export"});
+    if(!ok) return;
     UI.runTask("{{ url_for('finish') }}", {
       title: "Exporting — writing the workbook and collecting the PDFs…",
       done: () => { location.href = "{{ url_for('finish_page') }}"; },
@@ -136,65 +138,90 @@
 </script>
 
 <script>
-// Inline resolver (rows tab): expand a row to bind a PDF — near-miss candidates
-// plus a typo-tolerant path search — without opening a separate page. Preview uses
-// the shared drawer (window.LINK). Both reuse the same candidate renderer the
-// standalone picker uses, so a bind here behaves identically.
+// ---- tabs: unmatched rows vs. my bindings ---------------------------------
+// Both panes are rendered server-side (the active one is chosen there, so there's
+// no flash); this only swaps them on click and keeps ?tab= in sync so a reload or
+// a post-bind redirect lands on the same tab.
 (function(){
-  const loaded = new Set();
-  document.querySelectorAll("tr.rowtoggle").forEach(tr =>
-    tr.addEventListener("click", () => toggle(tr)));
+  const tabs = document.querySelectorAll("#review-tabs a");
+  const panes = document.querySelectorAll(".review-pane");
+  tabs.forEach(a => a.addEventListener("click", e => {
+    e.preventDefault();
+    const name = a.dataset.tab;
+    tabs.forEach(t => t.classList.toggle("on", t.dataset.tab === name));
+    panes.forEach(p => p.hidden = (p.dataset.pane !== name));
+    try{ history.replaceState(null, "", "?tab=" + name); }catch(err){}
+  }));
+})();
 
-  function toggle(tr){
-    const row = tr.dataset.row;
-    const panel = document.querySelector(`tr.resolver[data-for="${row}"]`);
-    if(!panel) return;
-    const opening = panel.hidden;
-    panel.hidden = !opening;
-    tr.classList.toggle("open", opening);
-    if(opening && !loaded.has(row)){ loaded.add(row); load(row, panel.querySelector(".cand")); }
+// ---- keep your place across a trip to "Find PDF…" and back ----------------
+// Resolving a row means leaving this page entirely (the dedicated picker can reach
+// every PDF in the tree, which an inline resolver couldn't) — so on a list of
+// dozens of rows, every bind used to land you back at the top. `pagehide` catches
+// every way off this page (a row click, "Find PDF…", the nav bar, the back button),
+// not just the ones this file knows about.
+(function(){
+  const KEY = "review-scroll-y";
+  window.addEventListener("pagehide", () => {
+    try{ sessionStorage.setItem(KEY, String(window.scrollY)); }catch(e){}
+  });
+  const y = (() => { try{ return sessionStorage.getItem(KEY); }catch(e){ return null; } })();
+  if(y != null){
+    try{ sessionStorage.removeItem(KEY); }catch(e){}
+    requestAnimationFrame(() => window.scrollTo(0, +y));
   }
+})();
 
-  async function load(row, box){
-    let j;
-    try{ j = await fetch(`/api/link/row/${row}/candidates`).then(r => r.json()); }
-    catch(e){ box.innerHTML = `<div class="banner bad">Couldn't load candidates. Is the scan still running?</div>`; return; }
-    box.innerHTML =
-      `<div class="muted" style="margin-bottom:6px">Closest detected invoices — Bind one, or search the whole tree below.</div>`
-      + LINK.resultsTable(j.candidates || [], +row)
-      + `<div style="margin-top:16px">
-           <label style="margin-bottom:6px">Search the whole tree for a PDF to bind</label>
-           <input class="cand-q searchbar" autocomplete="off" spellcheck="false"
-                  placeholder="Folder, company, filename or number — e.g. “apex aug 003”">
-           <div class="cand-results" style="margin-top:8px"></div>
-         </div>`;
-    UI.armForms(box);   // the Bind forms are built by JS
-    const q = box.querySelector(".cand-q"), out = box.querySelector(".cand-results");
-    let timer = null;
-    const go = () => { clearTimeout(timer); timer = setTimeout(() => search(row, q, out), 160); };
-    q.oninput = go;
-    // The webview fires no `input` for a paste; catch it explicitly (a tick later,
-    // once the value has landed) so pasting a number actually searches.
-    q.addEventListener("paste", () => setTimeout(go, 0));
-    // These inputs sit in no <form>, but the webview still treats Enter as a submit
-    // and reloads the page — which wiped what you just typed. Swallow it and search.
-    q.addEventListener("keydown", e => {
-      if(e.key === "Enter"){ e.preventDefault(); clearTimeout(timer); search(row, q, out); }
-    });
+// ---- a whole unmatched row is a link to its "Find PDF" picker page --------
+// (The inline search-from-the-table resolver was removed — resolving a row now
+// happens on the dedicated picker, which can reach every PDF in the tree.) Clicks
+// on the copy button or the "Find PDF…" link are left to do their own thing.
+(function(){
+  document.querySelectorAll("tr.datarow[data-link]").forEach(tr =>
+    tr.addEventListener("click", e => {
+      if(e.target.closest("a,button,form,input,.copybtn")) return;
+      location.href = tr.dataset.link;
+    }));
+})();
+
+// ---- shared row-table bookkeeping ------------------------------------------
+// Both "skip a supplier" and "mark row not found" remove rows the reviewer is
+// actively working through in a loop, so they patch the DOM in place instead of
+// reloading — a full-page reload on every single row would repaint the table and
+// drop the reviewer's scroll position dozens of times per session. The header
+// counts and "skipped suppliers" card are rendered server-side and swapped in as
+// HTML (not recomputed here) so they can never drift from what a reload would show.
+(function(){
+  function patchSummary(html){
+    const el = document.getElementById("review-summary");
+    if(el && html != null) el.innerHTML = html;
   }
-
-  async function search(row, q, out){
-    const s = q.value.trim();
-    if(!s){ out.innerHTML = ""; return; }
-    let j;
-    try{ j = await fetch("/api/link/search?q=" + encodeURIComponent(s)).then(r => r.json()); }
-    catch(e){ out.innerHTML = `<div class="banner bad">Search failed.</div>`; return; }
-    if(q.value.trim() !== s) return;      // a newer keystroke already won
-    out.innerHTML = LINK.resultsTable(j.hits || [], +row);
-    UI.armForms(out);
+  function patchBadge(unresolved){
+    const el = document.getElementById("rows-badge");
+    if(el && unresolved != null) el.textContent = unresolved;
   }
+  function checkEmpty(){
+    const table = document.getElementById("rows-table");
+    if(table && !table.querySelector("tr.datarow")){
+      table.outerHTML = '<div class="card"><span class="pill ok">all clear</span> ' +
+        'Every B2B row in the return is matched or skipped.</div>';
+    }
+  }
+  function patchBound(html, count){
+    const el = document.getElementById("bound-content");
+    if(el && html != null){ el.innerHTML = html; UI.armForms(el); }
+    const badge = document.getElementById("bound-badge");
+    if(badge && count != null) badge.textContent = count;
+  }
+  window.__reviewPatch = {patchSummary, patchBadge, checkEmpty, patchBound};
+})();
 
-  // ---- skip / un-skip a supplier ----------------------------------------
+// ---- skip / un-skip a supplier --------------------------------------------
+// Delegated (not bound per-element): "Skip this supplier" buttons only ever exist
+// at page load, but delegation keeps this consistent with mark/unmark below, whose
+// "Undo" button is injected fresh by patchBound and would otherwise get no listener.
+(function(){
+  const {patchSummary, patchBadge, checkEmpty} = window.__reviewPatch;
   async function setSkip(supplier, on){
     let r;
     try{
@@ -203,17 +230,85 @@
         body: JSON.stringify({supplier, on: on ? 1 : 0}),
       }).then(x => x.json());
     }catch(e){ r = {ok: false, error: String(e)}; }
-    if(r.ok) location.reload();
-    else alert((r && r.error) || "Could not update skip.");
+    if(!r.ok){ alert((r && r.error) || "Could not update skip."); return; }
+    if(on){
+      document.querySelectorAll(`tr[data-supplier="${CSS.escape(supplier)}"]`)
+        .forEach(tr => tr.remove());
+      patchBadge(r.unresolved);
+      checkEmpty();
+    } else {
+      // Un-skipping puts rows back into the queue — their exact position among the
+      // other groups isn't reconstructable client-side without duplicating the
+      // page's grouping logic, so this one still reloads (scroll position is kept
+      // by the pagehide/restore handler above, so it doesn't jump to the top).
+      location.reload();
+    }
+    patchSummary(r.summary_html);
+    const card = document.getElementById("skipped-card");
+    if(card && r.skipped_html != null) card.innerHTML = r.skipped_html;
   }
-  document.querySelectorAll(".skip-supplier").forEach(b =>
-    b.addEventListener("click", e => {
+  document.addEventListener("click", e => {
+    const b = e.target.closest(".skip-supplier");
+    if(b){
       e.stopPropagation();
       if(confirm(`Skip supplier “${b.dataset.supplier}”? Its unmatched rows leave the queue and export as SKIPPED.`))
         setSkip(b.dataset.supplier, true);
-    }));
-  document.querySelectorAll(".unskip").forEach(a =>
-    a.addEventListener("click", e => { e.preventDefault(); setSkip(a.dataset.supplier, false); }));
+      return;
+    }
+    const a = e.target.closest(".unskip");
+    if(a){ e.preventDefault(); setSkip(a.dataset.supplier, false); }
+  });
+})();
+
+// ---- mark / un-mark a single row as "searched, confirmed no PDF" -----------
+// Records that manual matching also came up empty, so the row leaves the queue and
+// the decision is auditable in the bindings tab + the export's Link Report. Marking
+// (on=true) also adds the row to "My bindings" immediately (patchBound), not just
+// on the next full page load — that tab's whole point is to show every hand
+// resolution the moment it happens.
+(function(){
+  const {patchSummary, patchBadge, checkEmpty, patchBound} = window.__reviewPatch;
+  async function setNotFound(row, on){
+    let r;
+    try{
+      r = await fetch("/api/link/mark_not_found", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({row, on: on ? 1 : 0}),
+      }).then(x => x.json());
+    }catch(e){ r = {ok: false, error: String(e)}; }
+    if(!r.ok){ alert((r && r.error) || "Could not update."); return; }
+    if(on){
+      const tr = document.querySelector(`tr.datarow[data-row="${row}"]`);
+      const supplier = tr && tr.dataset.supplier;
+      if(tr) tr.remove();
+      if(supplier != null && !document.querySelector(`tr.datarow[data-supplier="${CSS.escape(supplier)}"]`)){
+        const gh = document.querySelector(`tr.grouphead[data-supplier="${CSS.escape(supplier)}"]`);
+        if(gh) gh.remove();
+      }
+      patchBadge(r.unresolved);
+      checkEmpty();
+      patchBound(r.bound_html, r.bound_count);
+    } else {
+      // Un-marking puts the row back into the "rows" tab, which this page doesn't
+      // have the markup for without a full render — reload, scroll-preserved.
+      location.reload();
+    }
+    patchSummary(r.summary_html);
+  }
+  document.addEventListener("click", e => {
+    const b = e.target.closest(".mark-nf");
+    if(b){
+      e.stopPropagation();   // the row itself is a link to the picker
+      if(confirm("Mark this row as not found? Use this when you've searched and there is no PDF for it. It leaves the queue and exports as NOT FOUND — you can undo it from the “My bindings” tab."))
+        setNotFound(b.dataset.row, true);
+      return;
+    }
+    const u = e.target.closest(".unmark-nf");
+    if(u){
+      if(confirm("Undo this? The row goes back into the unmatched queue."))
+        setNotFound(u.dataset.row, false);
+    }
+  });
 })();
 </script>
 {% endblock %}

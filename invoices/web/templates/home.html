@@ -35,7 +35,12 @@
 
     <!-- Continue a saved run ------------------------------------------------ -->
     <div id="continue-fields" style="display:none">
-      <label>1 · Saved run folder <span class="muted">(an <span class="mono">out/run_…</span> folder from a previous scan)</span></label>
+      <label>1 · Recent runs</label>
+      <div id="recent-runs" class="grid" style="gap:8px;margin-bottom:14px">
+        <div class="muted">Looking for saved runs…</div>
+      </div>
+
+      <label>Or a specific saved run folder <span class="muted">(an <span class="mono">out/run_…</span> folder from a previous scan)</span></label>
       <div class="flex" style="gap:10px;align-items:center">
         <div class="col"><input id="cont" placeholder="/path/to/out/run_20240115-… (may be a copy you saved)" autocomplete="off"></div>
         <button class="btn ghost" id="cont-browse" type="button">Browse…</button>
@@ -133,7 +138,49 @@ function setMode(m){
   $("run").textContent = (m==="continue") ? "▶ Scan for new files & update this run" : "▶ Run";
 }
 $("src-local").onclick = () => { setMode("local"); loadYears(); };
-$("src-continue").onclick = () => { setMode("continue"); };
+$("src-continue").onclick = () => { setMode("continue"); loadRecentRuns(); };
+
+// ---- recent runs (the "pick up whenever you want" entry point) ------------
+// "Continue a saved run" already handles the hard part well (inspects the folder,
+// warns if the tree moved) — but it needed you to already know the exact path.
+// This lists the last few run folders so picking one up is a click, not a paste.
+let recentLoaded = false;
+async function loadRecentRuns(){
+  if(recentLoaded) return;
+  recentLoaded = true;
+  const el = $("recent-runs");
+  try{
+    const j = await fetch("/api/runs").then(r => r.json());
+    const runs = (j && j.runs) || [];
+    if(!runs.length){
+      el.innerHTML = '<div class="muted">No saved runs found yet.</div>';
+      return;
+    }
+    el.innerHTML = runs.map(r => {
+      const name = (r.root || "").split(/[\\/]/).filter(Boolean).pop() || r.run_id;
+      const status = r.complete
+        ? '<span class="pill ok">complete</span>'
+        : '<span class="pill warn">interrupted</span>';
+      const moved = r.tree_exists ? "" : ' <span class="pill bad">tree moved</span>';
+      return `<div class="card recent-run" style="cursor:pointer" data-dir="${esc(r.dir)}">
+        <div class="flex" style="justify-content:space-between;align-items:center;gap:10px">
+          <div style="min-width:0">
+            <b>${esc(name)}</b> <span class="muted">${esc(r.fy || "All years")}</span>
+            <div class="muted mono" style="font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.dir)}</div>
+          </div>
+          <div style="text-align:right;white-space:nowrap">${status}${moved}<br>
+            <span class="muted">${r.done||0} file(s) done</span></div>
+        </div>
+      </div>`;
+    }).join("");
+    el.querySelectorAll(".recent-run").forEach(card => card.onclick = () => {
+      $("cont").value = card.dataset.dir;
+      inspectRun();
+    });
+  }catch(e){
+    el.innerHTML = '<div class="muted">Could not load recent runs.</div>';
+  }
+}
 
 // ---- financial year -------------------------------------------------------
 // One GSTR-2A workbook covers one year, so a run is scoped to one FY folder and
@@ -408,6 +455,7 @@ function finishDone(rs){
 (function(){
   if(!hasNative()) $("type-hint").style.display = "inline";
   setMode(INIT.source_mode || "local");
+  if((INIT.source_mode || "local") === "continue") loadRecentRuns();
   const li = INIT.last_input;
   if(li){
     if(li.source_mode === "continue"){

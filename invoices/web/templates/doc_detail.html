@@ -15,6 +15,15 @@
 <div class="banner">✓ Saved — this invoice now matches <b>B2B row {{ linked }}</b> of the GSTR-2A return.</div>
 {% endif %}
 
+{% if bad_fields %}
+<div class="banner bad">
+  Everything else saved, but <b>{{ bad_fields|join(', ') }}</b>
+  {{ bad_fields|length > 1 and "weren't" or "wasn't" }} recognized as a number, so
+  {{ bad_fields|length > 1 and "they were" or "it was" }} left unchanged. Remove any
+  stray currency symbol or letter and save again.
+</div>
+{% endif %}
+
 <h1>{{ d.fields.invoice_id or d.id }}
   <span class="pill {{ 'bad' if d.confidence<0.6 else 'warn' if d.confidence<0.8 else 'ok' }}">conf {{ '%.2f'|format(d.confidence) }}</span>
   <span class="pill {{ 'warn' if d.source.value=='ocr' else 'info' }}">{{ d.source.value }}</span>

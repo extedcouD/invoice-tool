@@ -215,6 +215,22 @@ class RunStore:
         self.update_meta(skipped_suppliers=sorted(names))
         return names
 
+    # ---- rows the reviewer searched for by hand and confirmed have no PDF ----
+    # Same persistence shape as the manual row bindings and skipped suppliers above,
+    # so a "confirmed missing" mark survives a reopened/continued run.
+    def manual_not_found(self) -> set[int]:
+        return {int(r) for r in (self.read_meta().get("manual_not_found") or [])}
+
+    def set_manual_not_found(self, row: int, on: bool = True) -> set[int]:
+        """Mark (or, with on=False, un-mark) a B2B row as confirmed-no-PDF."""
+        rows = self.manual_not_found()
+        if on:
+            rows.add(int(row))
+        else:
+            rows.discard(int(row))
+        self.update_meta(manual_not_found=sorted(rows))
+        return rows
+
     def fy(self) -> Optional[str]:
         """The financial year this run was scoped to, or None if it scanned all years."""
         return self.read_meta().get("fy")
@@ -287,6 +303,29 @@ class RunStore:
                     and (run_dir / "checkpoint.jsonl").exists():
                 return cls(run_dir)
         return None
+
+    @classmethod
+    def list_recent(cls, out_root: Path, limit: int = 10) -> list[dict]:
+        """The most recently-touched run folders under ``out_root``, newest first —
+        backs the "Continue a saved run" picker so a reviewer can pick a run without
+        already knowing/typing its path. Each entry is a ``describe()`` dict; a run
+        folder that fails to open (mid-write, corrupt meta) is skipped rather than
+        breaking the whole list.
+        """
+        out_root = Path(out_root)
+        if not out_root.is_dir():
+            return []
+        candidates = [d for d in out_root.glob("run_*") if d.is_dir()]
+        candidates.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+        runs = []
+        for d in candidates[:limit]:
+            try:
+                info = cls.open_existing(d).describe()
+            except ValueError:
+                continue
+            info["modified"] = d.stat().st_mtime
+            runs.append(info)
+        return runs
 
     @classmethod
     def open_existing(cls, run_dir: Path | str) -> "RunStore":

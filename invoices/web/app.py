@@ -73,6 +73,49 @@ def create_app(controller: RunController) -> Flask:
     def plan():
         return controller.plan
 
+    def _macro(name):
+        """A macro from _macros.html, callable from Python — lets the skip/mark-not-found
+        AJAX endpoints render the exact same counts-summary and skipped-suppliers markup
+        as the full page, so an in-place DOM swap can never drift from a full reload."""
+        return getattr(app.jinja_env.get_template("_macros.html").make_module(), name)
+
+    def _bound_list(r, p):
+        """Every B2B row a human resolved by hand — a PDF bound to it, or a
+        "searched and confirmed no PDF exists" mark — so a decision can be reviewed
+        and undone instead of vanishing from the queue the moment it lands. Sourced
+        from the stored human assertions (manual links + confirmed-missing marks),
+        not the plan's matched rows — so a decision that is no longer *applied* (its
+        PDF was later rejected, or a corrected field auto-matched the row) stays
+        visible with a warning rather than silently disappearing.
+
+        Shared by the full page render and the mark-not-found AJAX response, so a
+        fresh mark shows up in "My bindings" immediately instead of waiting for the
+        next full page load.
+        """
+        from ..io.gstr import MANUAL_NOT_FOUND
+
+        if not r or not controller.store:
+            return []
+        docs_by_id = {d.id: d for d in r.documents}
+        row_by_num = {rm.row: rm for rm in p.rows} if p else {}
+        manual = controller.store.manual_links()
+        nf_marked = controller.store.manual_not_found()
+        bound = [{
+            "row": row_num, "kind": "bound", "doc_id": doc_id,
+            "doc": docs_by_id.get(doc_id), "rm": row_by_num.get(row_num),
+            "effective": bool(row_by_num.get(row_num)
+                              and row_by_num[row_num].manual
+                              and row_by_num[row_num].doc_id == doc_id),
+        } for row_num, doc_id in manual.items()]
+        bound += [{
+            "row": row_num, "kind": "not_found", "doc_id": None,
+            "doc": None, "rm": row_by_num.get(row_num),
+            "effective": bool(row_by_num.get(row_num)
+                              and row_by_num[row_num].status == MANUAL_NOT_FOUND),
+        } for row_num in nf_marked]
+        bound.sort(key=lambda b: b["row"])
+        return bound
+
     # `gen` is bumped by every edit; the key also carries the document count so a
     # still-growing checkpoint reindexes on its own.
     index_cache: dict = {"key": None, "index": None, "gen": 0}
@@ -120,10 +163,13 @@ def create_app(controller: RunController) -> Flask:
         p = plan()
         invoices = r.invoices()
         rows = p.unresolved_rows() if p else []
+        bound = _bound_list(r, p)
 
+        active_tab = "bound" if request.args.get("tab") == "bound" else "rows"
         return render_template(
             "review_list.html", plan=p,
-            counts=(p.counts() if p else None), rows=rows,
+            counts=(p.counts() if p else None), rows=rows, bound=bound,
+            active_tab=active_tab,
             skipped_suppliers=sorted(controller.store.skipped_suppliers())
             if controller.store else [],
             total=len(r.documents), invoice_count=len(invoices),
@@ -138,7 +184,9 @@ def create_app(controller: RunController) -> Flask:
         return render_template("doc_detail.html", d=d,
                                row=(p.by_doc.get(d.id) if p else None),
                                state=controller.run_state(), locked=_locked(),
-                               linked=request.args.get("linked"))
+                               linked=request.args.get("linked"),
+                               bad_fields=(request.args.get("bad_fields") or "").split(",")
+                               if request.args.get("bad_fields") else [])
 
     @app.route("/link/row/<int:row>")
     def link_row(row):
@@ -169,9 +217,13 @@ def create_app(controller: RunController) -> Flask:
 
         idx = index()
         folders = idx.suggest_folders(rm.supplier) if idx else []
+        # The next unresolved row after this one, so a reviewer working a long queue
+        # can move on without bouncing back through the list between every row.
+        pending = sorted(x.row for x in p.unresolved_rows() if x.row != row)
+        next_row = next((n for n in pending if n > row), pending[0] if pending else None)
         return render_template("link_row.html", rm=rm, scored=scored,
                                folder_hints=folders, q=(request.args.get("q") or ""),
-                               state=controller.run_state())
+                               state=controller.run_state(), next_row=next_row)
 
     # ---- data / actions --------------------------------------------------
     @app.route("/status")
@@ -227,6 +279,13 @@ def create_app(controller: RunController) -> Flask:
             return jsonify({"ok": False, "error": str(exc)}), 400
         return jsonify({"ok": True, **store.describe()})
 
+    @app.route("/api/runs")
+    def api_runs():
+        """The most recent saved runs, for the "Continue a saved run" picker — so
+        picking one up again doesn't require already knowing/typing its path."""
+        return jsonify({"ok": True,
+                        "runs": RunStore.list_recent(controller.output_root)})
+
     @app.route("/api/pause", methods=["POST"])
     def api_pause():
         res = controller.pause()
@@ -267,46 +326,6 @@ def create_app(controller: RunController) -> Flask:
             "gstr_row": d.gstr_row,
         }
 
-    def _cand(d, score) -> dict:
-        """A candidate Document (from `suggest`) flattened to the same shape as
-        `_hit`, so the inline resolver reuses the exact search/browse row renderer."""
-        return {
-            "id": d.id, "filename": d.filename,
-            "folder": d.path_info.company, "score": score,
-            "invoice_id": d.fields.invoice_id, "gstin": d.fields.vendor_gstin,
-            "vendor": d.fields.vendor_name_pdf, "date": d.fields.invoice_date,
-            "amount": d.fields.total_value, "company": d.path_info.company,
-            "confidence": round(d.confidence, 2),
-            "is_invoice": d.is_invoice, "doc_type": d.doc_type.value,
-            "gstr_row": d.gstr_row,
-        }
-
-    @app.route("/api/link/row/<int:row>/candidates")
-    def api_link_candidates(row):
-        """Field-based near-misses for one unmatched B2B row, for the inline
-        resolver on the rows tab (so a reviewer binds without opening a new page).
-
-        For an ambiguous row the candidates are already known; otherwise reuse the
-        same `suggest` ranking the standalone picker page uses.
-        """
-        from ..io.gstr import AMBIGUOUS, B2BRow, suggest
-
-        r, p = result(), plan()
-        if not r or not p:
-            return jsonify({"row": row, "candidates": []})
-        rm = next((x for x in p.rows if x.row == row), None)
-        if rm is None:
-            return jsonify({"row": row, "candidates": []})
-        invoices = r.invoices()
-        if rm.status == AMBIGUOUS:
-            by = {d.id: d for d in invoices}
-            cands = [(by[i], None) for i in rm.candidates if i in by]
-        else:
-            cands = suggest(B2BRow(row=rm.row, gstin=rm.gstin,
-                                   invoice_no=rm.invoice_no), invoices, limit=6)
-        return jsonify({"row": row, "status": rm.status,
-                        "candidates": [_cand(d, s) for d, s in cands]})
-
     @app.route("/api/link/skip_supplier", methods=["POST"])
     def skip_supplier():
         """Skip (or un-skip) a supplier: its unmatched rows leave the queue and are
@@ -324,7 +343,46 @@ def create_app(controller: RunController) -> Flask:
             controller.store.set_skipped_supplier(name, on)
             controller.rematch()
             _persist(result())
-        return jsonify({"ok": True, "supplier": name, "skipped": on})
+        p = plan()
+        return jsonify({
+            "ok": True, "supplier": name, "skipped": on,
+            "unresolved": len(p.unresolved_rows()) if p else 0,
+            "summary_html": str(_macro("review_summary")(p.counts() if p else None)),
+            "skipped_html": str(_macro("skipped_card")(
+                sorted(controller.store.skipped_suppliers()), _locked())),
+        })
+
+    @app.route("/api/link/mark_not_found", methods=["POST"])
+    def mark_not_found():
+        """Mark (or un-mark) a single B2B row as "searched by hand, no PDF exists".
+
+        It leaves the unmatched queue like a skip does, but is recorded per-row so the
+        export's Link Report and the bindings tab both show the reviewer *actively*
+        confirmed it missing — as opposed to the matcher merely failing to find it.
+        Re-runs the match so counts update immediately."""
+        if controller.store is None:
+            return jsonify({"ok": False, "error": "No run yet."}), 400
+        if _locked():
+            return jsonify({"ok": False, "error": "A scan or export is running."}), 409
+        data = request.get_json(silent=True) or request.form
+        try:
+            row = int(data.get("row"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "No row given."}), 400
+        on = str(data.get("on", "1")).lower() not in ("0", "false", "off", "")
+        with lock:
+            controller.store.set_manual_not_found(row, on)
+            controller.rematch()
+            _persist(result())
+        r, p = result(), plan()
+        bound = _bound_list(r, p)
+        return jsonify({
+            "ok": True, "row": row, "marked": on,
+            "unresolved": len(p.unresolved_rows()) if p else 0,
+            "summary_html": str(_macro("review_summary")(p.counts() if p else None)),
+            "bound_html": str(_macro("bound_pane")(bound, _locked())),
+            "bound_count": len(bound),
+        })
 
     @app.route("/api/link/search")
     def api_link_search():
@@ -431,6 +489,7 @@ def create_app(controller: RunController) -> Flask:
     _EDITABLE_FIELDS = ("invoice_id", "vendor_name_pdf", "vendor_gstin",
                         "invoice_date", "bill_to_name", "bill_to_gstin")
     _MONEY_FIELDS = ("taxable_value", "total_value")
+    _MONEY_LABELS = {"taxable_value": "taxable value", "total_value": "total value"}
 
     def _persist(r) -> None:
         # detections.json only — NOT the master workbook. The master is O(corpus) to
@@ -468,12 +527,16 @@ def create_app(controller: RunController) -> Flask:
             for k in _EDITABLE_FIELDS:
                 if k in form:
                     setattr(d.fields, k, form[k].strip() or None)
+            # A field that fails to parse must not vanish silently — it used to be
+            # dropped with `except ValueError: pass`, so a mistyped amount looked
+            # saved (the redirect succeeded) but the edit was quietly discarded.
+            bad_fields = []
             for k in _MONEY_FIELDS:
                 if k in form and form[k].strip():
                     try:
                         setattr(d.fields, k, round(float(form[k].replace(",", "")), 2))
                     except ValueError:
-                        pass
+                        bad_fields.append(k)
             d.reviewed = True
             record(d, "review", "confirmed", "human-confirmed via web UI")
             # Re-match immediately: correcting a GSTIN or an invoice number is
@@ -482,6 +545,10 @@ def create_app(controller: RunController) -> Flask:
             before = d.gstr_row
             controller.rematch()
             _persist(result())
+        if bad_fields:
+            labels = [_MONEY_LABELS.get(k, k) for k in bad_fields]
+            return redirect(url_for("doc_detail", doc_id=doc_id,
+                                    bad_fields=",".join(labels)))
         landed = d.gstr_row if d.gstr_row != before else None
         if landed:
             return redirect(url_for("doc_detail", doc_id=doc_id, linked=landed))
@@ -548,7 +615,9 @@ def create_app(controller: RunController) -> Flask:
             controller.store.set_manual_link(row, doc_id)
             controller.rematch()
             _persist(result())
-        return redirect(url_for("review", tab="rows"))
+        # Undo from the "My bindings" tab posts tab=bound so it lands back there;
+        # a fresh bind from the picker page falls back to the unmatched-rows tab.
+        return redirect(url_for("review", tab=request.form.get("tab", "rows")))
 
     @app.route("/finish", methods=["POST"])
     def finish():

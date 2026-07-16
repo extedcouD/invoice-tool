@@ -56,6 +56,7 @@ MATCHED = "matched"
 NOT_FOUND = "not_found"
 AMBIGUOUS = "ambiguous"
 SKIPPED = "skipped"        # the reviewer skipped this supplier's unmatched rows
+MANUAL_NOT_FOUND = "manual_not_found"   # the reviewer searched and confirmed no PDF exists
 
 
 # --------------------------------------------------------------------------- #
@@ -90,9 +91,10 @@ class RowMatch:
 
     @property
     def unresolved(self) -> bool:
-        # SKIPPED is a deliberate resolution ("don't chase this supplier"), so it
-        # leaves the human queue just like MATCHED does.
-        return self.status not in (MATCHED, SKIPPED)
+        # SKIPPED and MANUAL_NOT_FOUND are both deliberate human resolutions ("don't
+        # chase this supplier" / "I looked and there is no PDF"), so they leave the
+        # human queue just like MATCHED does.
+        return self.status not in (MATCHED, SKIPPED, MANUAL_NOT_FOUND)
 
 
 @dataclass
@@ -110,6 +112,8 @@ class LinkPlan:
             "not_found": sum(1 for r in self.rows if r.status == NOT_FOUND),
             "ambiguous": sum(1 for r in self.rows if r.status == AMBIGUOUS),
             "skipped": sum(1 for r in self.rows if r.status == SKIPPED),
+            "manual_not_found": sum(1 for r in self.rows
+                                    if r.status == MANUAL_NOT_FOUND),
             "unreferenced": len(self.unreferenced),
             "duplicate_filings": self.duplicate_filings,
         }
@@ -143,12 +147,14 @@ class LinkReport:
     not_found: int = 0
     ambiguous: int = 0
     skipped: int = 0
+    manual_not_found: int = 0
     copy_failed: int = 0
     duplicate_filings: int = 0
     unreferenced_invoices: int = 0
     unmatched_rows: list = field(default_factory=list)   # (row, gstin, invno)
     ambiguous_rows: list = field(default_factory=list)   # (row, gstin, invno, n)
     skipped_rows: list = field(default_factory=list)     # (row, gstin, invno, supplier)
+    manual_not_found_rows: list = field(default_factory=list)  # (row, gstin, invno, supplier)
     out_path: Path | None = None
     flat_dir: Path | None = None
 
@@ -310,7 +316,8 @@ def read_b2b_rows(gstr_path: Path | str,
 # --------------------------------------------------------------------------- #
 def match(rows: Iterable[B2BRow], invoices: Iterable[Document],
           manual: dict[int, str] | None = None,
-          skipped: Iterable[str] | None = None) -> LinkPlan:
+          skipped: Iterable[str] | None = None,
+          not_found_rows: Iterable[int] | None = None) -> LinkPlan:
     """Resolve every B2B row to an invoice. No I/O — safe to re-run on every edit.
 
     ``manual`` maps a sheet row number to a doc id a human bound by hand; it wins
@@ -319,10 +326,17 @@ def match(rows: Iterable[B2BRow], invoices: Iterable[Document],
     ``skipped`` is a set of supplier trade/legal names the reviewer chose to skip;
     any of their rows the matcher *can't* resolve become ``SKIPPED`` (a match still
     wins over a skip), so a whole entity drops out of the queue in one action.
+
+    ``not_found_rows`` is a set of sheet row numbers a reviewer searched for by hand
+    and confirmed have no PDF; any that stay unresolved become ``MANUAL_NOT_FOUND``
+    and leave the queue. It is a *per-row* human decision, so it wins over a
+    supplier-level skip for those rows — but a real match (including a manual bind)
+    still wins over it.
     """
     invoices = list(invoices)
     manual = manual or {}
     skip_keys = {norm_supplier(s) for s in (skipped or [])}
+    nf_rows = {int(r) for r in (not_found_rows or [])}
     by_id = {d.id: d for d in invoices}
     by_key, by_invno = _build_index(invoices)
 
@@ -376,8 +390,16 @@ def match(rows: Iterable[B2BRow], invoices: Iterable[Document],
         plan.by_doc[doc.id] = rm
         matched_ids.add(doc.id)
 
-    # A skipped supplier's *unmatched* rows (not_found / ambiguous) become SKIPPED,
-    # so they leave the queue; matched rows are untouched.
+    # A reviewer's per-row "I looked and there's no PDF" resolves those rows first,
+    # so it wins over a supplier skip for the same row (both leave the queue, but they
+    # export differently — NOT FOUND vs SKIPPED).
+    if nf_rows:
+        for rm in plan.rows:
+            if rm.unresolved and rm.row in nf_rows:
+                rm.status = MANUAL_NOT_FOUND
+
+    # A skipped supplier's *still-unmatched* rows (not_found / ambiguous) become
+    # SKIPPED, so they leave the queue; matched and manual-not-found rows are untouched.
     if skip_keys:
         for rm in plan.rows:
             if rm.unresolved and norm_supplier(rm.supplier) in skip_keys:
@@ -523,6 +545,16 @@ def write_linked(result: RunResult, plan: LinkPlan, gstr_path: Path, store: RunS
             _unresolved(rm, "SKIPPED")
             continue
 
+        if rm.status == MANUAL_NOT_FOUND:
+            # There genuinely is no PDF, so the cell says NOT FOUND like an
+            # auto-miss — but it is counted separately, because a reviewer actively
+            # confirmed this one rather than the matcher merely failing to find it.
+            rep.manual_not_found += 1
+            rep.manual_not_found_rows.append(
+                (rm.row, rm.gstin, rm.invoice_no, rm.supplier))
+            _unresolved(rm, "NOT FOUND")
+            continue
+
         if rm.status == NOT_FOUND:
             rep.not_found += 1
             rep.unmatched_rows.append((rm.row, rm.gstin, rm.invoice_no))
@@ -616,6 +648,7 @@ def _write_report_sheet(wb, rep: LinkReport, gstr_path: Path, sheet_name: str) -
         ("not_found", rep.not_found),
         ("ambiguous", rep.ambiguous),
         ("skipped", rep.skipped),
+        ("reviewer_confirmed_not_found", rep.manual_not_found),
         ("copy_failed", rep.copy_failed),
         ("duplicate_filings", rep.duplicate_filings),
         ("detected_invoices_unreferenced", rep.unreferenced_invoices),
@@ -643,6 +676,13 @@ def _write_report_sheet(wb, rep: LinkReport, gstr_path: Path, sheet_name: str) -
         for row, gstin, invno, supplier in rep.skipped_rows:
             ws.append([row, gstin, invno, supplier])
 
+    if rep.manual_not_found_rows:
+        ws.append([])
+        ws.append(["NOT FOUND — reviewer searched by hand and confirmed no PDF exists"])
+        ws.append(["row", "GSTIN of Supplier", "Invoice Number", "Supplier"])
+        for row, gstin, invno, supplier in rep.manual_not_found_rows:
+            ws.append([row, gstin, invno, supplier])
+
     _autosize(ws, ["metric", "value", "col3", "col4"])
 
 
@@ -662,7 +702,8 @@ def link_gstr(result: RunResult, gstr_path: Path, store: RunStore,
     rows = read_b2b_rows(gstr_path, sheet_name, ref_header)
     plan = match(rows, result.invoices(),
                  store.manual_links() if manual is None else manual,
-                 skipped=store.skipped_suppliers())
+                 skipped=store.skipped_suppliers(),
+                 not_found_rows=store.manual_not_found())
     apply_plan(result, plan)
     store.save_link(plan)
     store.update_meta(gstr_path=str(gstr_path))

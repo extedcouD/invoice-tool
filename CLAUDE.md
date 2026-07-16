@@ -262,10 +262,21 @@ Key structural facts (each requires reading several files to reconstruct):
   invoice-number-only when the composite `(GSTIN, number)` key misses, so a mis-OCR'd GSTIN
   doesn't lose the link. It only refuses to guess when one number maps to *conflicting* GSTINs —
   that surfaces as `ambiguous` for a human to settle, never a silent pick.
-- **The review queue is the linking cockpit, not a confidence queue.** Its first tab is "GSTR
-  rows with no PDF" — the client's actual question. Low-confidence flags are the *third* tab.
-  A human resolving a row (manual bind, or correcting a field) is the point of the whole app,
-  so every such action re-runs `match` and reports what changed.
+- **The review queue is the linking cockpit, not a confidence queue.** Its first tab is
+  "Unmatched rows" — the GSTR rows with no PDF, the client's actual question. A human resolving a
+  row (manual bind, correcting a field, skipping a supplier, or confirming a row has no PDF) is
+  the point of the whole app, so every such action re-runs `match` and reports what changed.
+- **A reviewer has three ways to resolve a row, and every one is recorded + undoable.** Besides
+  binding a PDF, a reviewer can **skip a whole supplier** (`set_skipped_supplier` → `SKIPPED`) or
+  mark a single row **confirmed-not-found** (`set_manual_not_found` → `MANUAL_NOT_FOUND`), both
+  persisted in `run_meta.json` beside `manual_links` and both threaded through `match()` as
+  params (`skipped=` / `not_found_rows=`). `MANUAL_NOT_FOUND` is a *per-row* human decision, so it
+  wins over a supplier skip for that row but a real match still wins over it; it exports `NOT
+  FOUND` in the ref cell yet is counted separately on the Link Report (`reviewer_confirmed_not_
+  found`) so "we actively confirmed this missing" is distinct from "the matcher failed". The
+  second review tab, **"My bindings"**, lists every hand resolution (bound PDFs + confirmed-missing
+  marks) with an Undo, so a decision never silently vanishes from the queue — sourced from the
+  stored human assertions, not the plan, so a decision no longer *applied* still shows, flagged.
 - **A human may bind a row to a PDF the classifier did *not* call an invoice — and that
   promotes it.** Search and browse deliberately range over every PDF in the tree, because a row
   with no PDF very often points at one scored an approval or missed outright; hiding those hides
