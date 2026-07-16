@@ -198,6 +198,23 @@ class RunStore:
         self.update_meta(manual_links={str(k): v for k, v in links.items()})
         return links
 
+    # ---- suppliers the reviewer chose to skip -----------------------------
+    # Stored raw (as shown on the sheet); matching normalizes both sides. Persisted
+    # in the meta so a skip survives a reopened/continued run, exactly like the
+    # manual row bindings above.
+    def skipped_suppliers(self) -> set[str]:
+        return set(self.read_meta().get("skipped_suppliers") or [])
+
+    def set_skipped_supplier(self, name: str, on: bool = True) -> set[str]:
+        """Skip (or, with on=False, un-skip) a supplier's unmatched rows."""
+        names = self.skipped_suppliers()
+        if on and name:
+            names.add(name)
+        else:
+            names.discard(name)
+        self.update_meta(skipped_suppliers=sorted(names))
+        return names
+
     def fy(self) -> Optional[str]:
         """The financial year this run was scoped to, or None if it scanned all years."""
         return self.read_meta().get("fy")
@@ -233,11 +250,12 @@ class RunStore:
 
     @classmethod
     def find_resumable(cls, out_root: Path, root: str,
-                       fy: str | None = None) -> Optional["RunStore"]:
+                       fy: str | None = None,
+                       pages: bool | None = None) -> Optional["RunStore"]:
         """Newest incomplete run under ``out_root`` for the same input (has a
         checkpoint, meta.complete is False), or None.
 
-        The input is **(root, fy)**, not root alone. A year-scoped run and an
+        The input is **(root, fy, pages)**, not root alone. A year-scoped run and an
         all-years run over the same tree share a ``root``, so matching on root alone
         would let a fresh "FY 23-24" run reopen an interrupted "FY 22-23" checkpoint
         — and ``checkpoint_docs()`` would then assemble one detections.json spanning
@@ -247,8 +265,15 @@ class RunStore:
         ``root`` is also what every path is made relative to (``io/excel._rel``,
         ``PathIndex``) and so has to stay a real path.
 
-        Runs written before this key existed have no "fy", so they read as None and
-        still resume an unscoped run.
+        ``pages`` (per-page explosion) is the same kind of corpus identity: a
+        page-exploding run must never reopen a whole-file checkpoint, or the ledger
+        would mix a stale whole-file doc with its N page docs. When ``pages`` is None
+        the caller opts out of that filter (back-compat); when a bool, a run matches
+        only if its recorded ``pages`` marker agrees (a pre-feature run with no marker
+        reads as False, so it is refused by a page-exploding run).
+
+        Runs written before the ``fy`` key existed have no "fy", so they read as None
+        and still resume an unscoped run.
         """
         runs = sorted(Path(out_root).glob("run_*"))
         for run_dir in reversed(runs):
@@ -258,6 +283,7 @@ class RunStore:
                 continue
             if meta.get("root") == root and meta.get("fy") == fy \
                     and not meta.get("complete") \
+                    and (pages is None or bool(meta.get("pages")) == pages) \
                     and (run_dir / "checkpoint.jsonl").exists():
                 return cls(run_dir)
         return None

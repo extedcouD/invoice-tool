@@ -19,7 +19,7 @@ from .core.interfaces import FileSource
 from .core.models import Document, DocType, RunResult
 from .core.pipeline import Pipeline
 from .io.excel import write_master
-from .io.pdf import PdfTextSource
+from .io.pdf import PdfTextSource, write_page_pdf
 from .io.runstore import RunStore
 from .io.sources import LocalFileSource
 from .matching import vendor as vendormatch
@@ -30,7 +30,7 @@ from .stages.extract import ExtractStage
 from .stages.parse import ParseStage
 from .stages.reconcile import ReconcileStage
 from .stages.validate import ValidateStage
-from .stages.walk import walk
+from .stages.walk import walk, walk_pages
 
 # A walker streams seed Documents from a root (a local path), checking in with the
 # RunControl as it goes. Kept pluggable behind the FileSource seam.
@@ -103,9 +103,14 @@ def _copy_one_flagged(d: Document, store: RunStore, file_source: FileSource) -> 
         record(d, "review", "fetch_failed", str(exc), severity="warn")
         return
     try:
-        shutil.copy2(local, dest)
+        # A page-invoice copies just its own page, so the review PDF shows one
+        # invoice; a whole-file doc is a straight byte copy as before.
+        if d.page_index is not None:
+            write_page_pdf(local, d.page_index, dest)
+        else:
+            shutil.copy2(local, dest)
         d.review_pdf_path = str(dest.resolve())  # absolute so the web app can serve it
-    except OSError as exc:
+    except Exception as exc:
         record(d, "review", "copy_failed", str(exc), severity="warn")
     finally:
         file_source.cleanup(d, local)
@@ -155,7 +160,9 @@ def run_scan(root, out_root: Path, settings: Settings = DEFAULTS,
     the UI can stop claiming to scan while it is really writing a workbook.
     """
     file_source = file_source or LocalFileSource()
-    walker = walker or walk
+    # Explode each PDF into one invoice per page (always on) unless a caller opts
+    # out via Settings (tests) or injects its own walker.
+    walker = walker or (walk_pages if settings.explode_pages else walk)
     # A caller (e.g. the desktop RunController) may pre-create/reopen the run dir
     # so it can poll status.json from t=0; otherwise mint a fresh one here.
     store = store or RunStore.new(out_root, label=settings.fy_scope)
@@ -164,7 +171,12 @@ def run_scan(root, out_root: Path, settings: Settings = DEFAULTS,
     # (see find_resumable) — an all-years run and a one-year run over the same tree
     # are different corpora.
     root_key = root_key if root_key is not None else str(Path(root).resolve())
-    store.write_meta(root=root_key, complete=False, fy=settings.fy_scope)
+    # `pages` records whether this run splits PDFs per page. It is part of the run's
+    # corpus identity (like `fy`): a page-exploded run must never resume a whole-file
+    # checkpoint, or one `detections.json` would mix a stale whole-file doc with its
+    # N page docs. See RunStore.find_resumable.
+    store.write_meta(root=root_key, complete=False, fy=settings.fy_scope,
+                     pages=settings.explode_pages)
 
     def phase(name: str) -> None:
         if on_phase is not None:
@@ -225,7 +237,8 @@ def run_scan(root, out_root: Path, settings: Settings = DEFAULTS,
     result.finished_at = datetime.now().isoformat(timespec="seconds")
     store.save(result)
     write_master(result, store.master_path())
-    store.write_meta(root=root_key, complete=complete, fy=settings.fy_scope)
+    store.write_meta(root=root_key, complete=complete, fy=settings.fy_scope,
+                     pages=settings.explode_pages)
     reporter.finish(result.summary())
     return store, result
 
@@ -242,7 +255,8 @@ def link_now(result: RunResult, gstr_path: Path, store: RunStore,
 
     gstr_path = _keep_gstr_with_run(Path(gstr_path), store)
     rows = read_b2b_rows(gstr_path)
-    plan = match(rows, result.invoices(), store.manual_links())
+    plan = match(rows, result.invoices(), store.manual_links(),
+                 skipped=store.skipped_suppliers())
     apply_plan(result, plan)
     store.save_link(plan)
     return plan

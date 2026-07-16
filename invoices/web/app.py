@@ -108,24 +108,24 @@ def create_app(controller: RunController) -> Flask:
 
     @app.route("/review")
     def review():
-        """The linking cockpit: unmatched B2B rows | unlinked invoices | flagged."""
+        """The linking cockpit: the B2B rows that still have no PDF.
+
+        This is the whole product — which rows the sheet asks for that the scan
+        could not find. (The old low-confidence review tab was removed; it never
+        helped link a row, which is the only thing this queue is for.)
+        """
         r = result()
         if not r:
             return redirect(url_for("home"))
         p = plan()
         invoices = r.invoices()
-        by_id = {d.id: d for d in r.documents}
-
-        tab = request.args.get("tab") or ("rows" if p else "flagged")
         rows = p.unresolved_rows() if p else []
-        unlinked = [by_id[i] for i in (p.unreferenced if p else []) if i in by_id]
-        # worst-first: hard flags & low confidence at the top
-        flagged = sorted(r.flagged(), key=lambda d: (d.confidence, -len(d.flags)))
 
         return render_template(
-            "review_list.html", tab=tab, plan=p,
-            counts=(p.counts() if p else None),
-            rows=rows, unlinked=unlinked, flagged=flagged, by_id=by_id,
+            "review_list.html", plan=p,
+            counts=(p.counts() if p else None), rows=rows,
+            skipped_suppliers=sorted(controller.store.skipped_suppliers())
+            if controller.store else [],
             total=len(r.documents), invoice_count=len(invoices),
             locked=_locked(), state=controller.run_state())
 
@@ -261,10 +261,70 @@ def create_app(controller: RunController) -> Flask:
             "folder": h.folder, "rel": h.rel, "score": h.score,
             "invoice_id": d.fields.invoice_id, "gstin": d.fields.vendor_gstin,
             "vendor": d.fields.vendor_name_pdf, "date": d.fields.invoice_date,
-            "company": d.path_info.company, "confidence": round(d.confidence, 2),
+            "amount": d.fields.total_value, "company": d.path_info.company,
+            "confidence": round(d.confidence, 2),
             "is_invoice": d.is_invoice, "doc_type": d.doc_type.value,
             "gstr_row": d.gstr_row,
         }
+
+    def _cand(d, score) -> dict:
+        """A candidate Document (from `suggest`) flattened to the same shape as
+        `_hit`, so the inline resolver reuses the exact search/browse row renderer."""
+        return {
+            "id": d.id, "filename": d.filename,
+            "folder": d.path_info.company, "score": score,
+            "invoice_id": d.fields.invoice_id, "gstin": d.fields.vendor_gstin,
+            "vendor": d.fields.vendor_name_pdf, "date": d.fields.invoice_date,
+            "amount": d.fields.total_value, "company": d.path_info.company,
+            "confidence": round(d.confidence, 2),
+            "is_invoice": d.is_invoice, "doc_type": d.doc_type.value,
+            "gstr_row": d.gstr_row,
+        }
+
+    @app.route("/api/link/row/<int:row>/candidates")
+    def api_link_candidates(row):
+        """Field-based near-misses for one unmatched B2B row, for the inline
+        resolver on the rows tab (so a reviewer binds without opening a new page).
+
+        For an ambiguous row the candidates are already known; otherwise reuse the
+        same `suggest` ranking the standalone picker page uses.
+        """
+        from ..io.gstr import AMBIGUOUS, B2BRow, suggest
+
+        r, p = result(), plan()
+        if not r or not p:
+            return jsonify({"row": row, "candidates": []})
+        rm = next((x for x in p.rows if x.row == row), None)
+        if rm is None:
+            return jsonify({"row": row, "candidates": []})
+        invoices = r.invoices()
+        if rm.status == AMBIGUOUS:
+            by = {d.id: d for d in invoices}
+            cands = [(by[i], None) for i in rm.candidates if i in by]
+        else:
+            cands = suggest(B2BRow(row=rm.row, gstin=rm.gstin,
+                                   invoice_no=rm.invoice_no), invoices, limit=6)
+        return jsonify({"row": row, "status": rm.status,
+                        "candidates": [_cand(d, s) for d, s in cands]})
+
+    @app.route("/api/link/skip_supplier", methods=["POST"])
+    def skip_supplier():
+        """Skip (or un-skip) a supplier: its unmatched rows leave the queue and are
+        written SKIPPED on export. Re-runs the match so counts update immediately."""
+        if controller.store is None:
+            return jsonify({"ok": False, "error": "No run yet."}), 400
+        if _locked():
+            return jsonify({"ok": False, "error": "A scan or export is running."}), 409
+        data = request.get_json(silent=True) or request.form
+        name = (data.get("supplier") or "").strip()
+        on = str(data.get("on", "1")).lower() not in ("0", "false", "off", "")
+        if not name:
+            return jsonify({"ok": False, "error": "No supplier given."}), 400
+        with lock:
+            controller.store.set_skipped_supplier(name, on)
+            controller.rematch()
+            _persist(result())
+        return jsonify({"ok": True, "supplier": name, "skipped": on})
 
     @app.route("/api/link/search")
     def api_link_search():
@@ -294,6 +354,29 @@ def create_app(controller: RunController) -> Flask:
             "files": [_hit(h) for h in b["files"]],
         })
 
+    @app.route("/api/link/all")
+    def api_link_all():
+        """A flat, paginated list of *every* PDF in the run — the exhaustive
+        counterpart to the ranked fuzzy search. ``q`` filters by a plain
+        substring over each file's name, folder path and extracted text, so the
+        one box searches filename, path and content together.
+        """
+        idx = index()
+        if idx is None:
+            return jsonify({"files": [], "total": 0, "page": 1, "pages": 0,
+                            "page_size": 50})
+        q = (request.args.get("q") or "").strip()
+        try:
+            page = int(request.args.get("page", 1))
+        except (TypeError, ValueError):
+            page = 1
+        res = idx.flat(q, page=page, page_size=50)
+        return jsonify({
+            "q": q, "total": res["total"], "page": res["page"],
+            "pages": res["pages"], "page_size": res["page_size"],
+            "files": [_hit(h) for h in res["files"]],
+        })
+
     @app.route("/pdf/<doc_id>")
     def pdf(doc_id):
         """Serve a document's PDF, fetching it on demand if it wasn't pre-copied.
@@ -305,6 +388,32 @@ def create_app(controller: RunController) -> Flask:
         d = doc_by_id(doc_id)
         if not d:
             abort(404)
+        # A page-invoice must show only its page. A pre-copied review_pdf_path is
+        # already sliced to one page; otherwise slice on demand from the source file
+        # (serving d.path directly would show the whole multi-invoice PDF).
+        if d.page_index is not None:
+            rp = d.review_pdf_path
+            if rp:
+                p = Path(rp)
+                if not p.is_absolute():
+                    p = (Path.cwd() / p).resolve()
+                if p.exists():
+                    return send_file(str(p), mimetype="application/pdf")
+            try:
+                local = controller.file_source.materialize(d)
+            except Exception:
+                abort(404)
+            import fitz
+            import io as _io
+            try:
+                with fitz.open(local) as s, fitz.open() as out:
+                    out.insert_pdf(s, from_page=d.page_index, to_page=d.page_index)
+                    data = out.tobytes()
+            except Exception:
+                abort(404)
+            finally:
+                controller.file_source.cleanup(d, local)
+            return send_file(_io.BytesIO(data), mimetype="application/pdf")
         for cand in (d.review_pdf_path, d.path):
             if not cand:
                 continue

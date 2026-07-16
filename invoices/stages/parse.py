@@ -28,8 +28,14 @@ class ParseStage(Stage):
     name = "parse"
 
     def process(self, doc: Document) -> Document:
-        # id from filename always (cheap, canonical, useful for linking).
-        doc.fields.invoice_id = _id_from_filename(doc.filename)
+        # id from filename always (cheap, canonical, useful for linking). When a
+        # multi-page PDF was exploded into one invoice per page, the pages share a
+        # filename — suffix the page number so their ids don't collide (which would
+        # otherwise false-flag every page as a `duplicate_id` of its siblings).
+        base = _id_from_filename(doc.filename)
+        if base and doc.page_index is not None:
+            base = f"{base}-p{doc.page_index + 1}"
+        doc.fields.invoice_id = base
 
         # Only mine body fields for actual invoices.
         if doc.doc_type != DocType.INVOICE:

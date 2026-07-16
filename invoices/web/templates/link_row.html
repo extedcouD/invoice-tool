@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as m %}
 {% block title %}B2B row {{ rm.row }} — find PDF{% endblock %}
 {% block body %}
 <p><a href="{{ url_for('review', tab='rows') }}">← back to unmatched rows</a></p>
@@ -10,11 +11,19 @@
 
 <div class="card" style="margin-bottom:18px">
   <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr))">
-    <div><label>supplier GSTIN</label><div class="mono">{{ rm.gstin or '—' }}</div></div>
-    <div><label>invoice number</label><div class="mono">{{ rm.invoice_no or '—' }}</div></div>
-    <div><label>supplier</label><div>{{ rm.supplier or '—' }}</div></div>
-    <div><label>invoice value</label><div class="mono">{{ rm.value or '—' }}</div></div>
+    <div><label>supplier GSTIN</label><div class="mono">{{ rm.gstin or '—' }}{{ m.copyable(rm.gstin) }}</div></div>
+    <div><label>invoice number</label><div class="mono">{{ rm.invoice_no or '—' }}{{ m.copyable(rm.invoice_no) }}</div></div>
+    <div><label>invoice date</label><div class="mono">{{ rm.invoice_date or '—' }}{{ m.copyable(rm.invoice_date) }}</div></div>
+    <div><label>supplier</label><div>{{ rm.supplier or '—' }}{{ m.copyable(rm.supplier) }}</div></div>
+    <div><label>invoice value</label><div class="mono">{{ rm.value or '—' }}{{ m.copyable(rm.value) }}</div></div>
   </div>
+  {% if rm.existing_ref %}
+  <div style="margin-top:10px">
+    <span class="pill info">sheet already links →</span>
+    <span class="mono">{{ rm.existing_ref }}</span>{{ m.copyable(rm.existing_ref) }}
+    <span class="muted">— binding a PDF replaces this; leaving it keeps the value.</span>
+  </div>
+  {% endif %}
   {% if rm.manual %}
   <div style="margin-top:12px">
     <span class="pill ok">bound by hand</span>
@@ -30,6 +39,7 @@
   <a href="#" data-mode="near" class="on">Closest matches <span class="n">{{ scored|length }}</span></a>
   <a href="#" data-mode="search">Search by path or field</a>
   <a href="#" data-mode="browse">Browse folders</a>
+  <a href="#" data-mode="all">Browse PDFs</a>
 </div>
 <div style="height:16px"></div>
 
@@ -52,19 +62,21 @@
   {% else %}
   <table>
     <tr><th>invoice id</th><th>folder</th><th>GSTIN</th><th>date</th>
-        <th>conf</th><th>match</th><th></th></tr>
+        <th class="right">amount</th><th>conf</th><th>match</th><th></th></tr>
     {% for d, s in scored %}
     <tr>
       <td class="mono">{{ d.fields.invoice_id or d.filename }}</td>
       <td class="muted">{{ d.path_info.company or '—' }}</td>
       <td class="mono muted">{{ d.fields.vendor_gstin or '—' }}</td>
       <td class="muted">{{ d.fields.invoice_date or '—' }}</td>
+      <td class="mono muted right">{{ '{:,.2f}'.format(d.fields.total_value) if d.fields.total_value is not none else '—' }}</td>
       <td><span class="pill {{ 'bad' if d.confidence<0.6 else 'warn' if d.confidence<0.8 else 'ok' }}">{{ '%.2f'|format(d.confidence) }}</span></td>
       <td>{% if s is not none %}
         <span class="pill {{ 'ok' if s>=85 else 'warn' if s>=60 else 'info' }}">{{ s|round(0)|int }}%</span>
       {% else %}<span class="muted">—</span>{% endif %}</td>
       <td class="right" style="white-space:nowrap">
-        <a class="btn ghost sm" href="{{ url_for('doc_detail', doc_id=d.id) }}">Preview</a>
+        <button class="btn ghost sm" type="button" data-preview="{{ d.id }}"
+                data-label="{{ d.fields.invoice_id or d.filename }}">Preview</button>
         <form method="post" action="{{ url_for('bind_row', row=rm.row) }}"
               style="display:inline" data-busy="Binding…">
           <input type="hidden" name="doc_id" value="{{ d.id }}">
@@ -80,7 +92,7 @@
 {# ---- 2 · typo-tolerant search over the original paths --------------------- #}
 <div id="pane-search" hidden>
   <div style="position:relative">
-    <input id="q" autocomplete="off" spellcheck="false" value="{{ q }}"
+    <input id="q" class="searchbar" autocomplete="off" spellcheck="false" value="{{ q }}"
            placeholder="Type a folder, month, company, filename or number — e.g. “apex aug 003”">
     <div id="ac" class="ac" hidden></div>
   </div>
@@ -108,6 +120,20 @@
   <div id="browse-results"></div>
 </div>
 
+{# ---- 4 · flat, paginated list of every PDF (filename / path / content) ---- #}
+<div id="pane-all" hidden>
+  <input id="all-q" class="searchbar" autocomplete="off" spellcheck="false"
+         placeholder="Search every PDF by filename, folder path, or text inside it…">
+  <p class="muted" style="margin:8px 0 6px">
+    Every PDF in the tree, in filing order. This search also looks <b>inside</b>
+    each PDF's extracted text — so a term that appears only in the body (a PO
+    number, a bill-to name) still finds the file. Paged, so you can work through
+    all of them.
+  </p>
+  <div id="all-results"></div>
+  <div id="all-pager" class="pager"></div>
+</div>
+
 <p class="muted" style="margin-top:14px">
   Binding is remembered for this run and honoured by the final export — the PDF is
   copied into the flat folder and its name written into the row's
@@ -131,63 +157,32 @@
 
 <script>
 (function(){
-  const BIND = "{{ url_for('bind_row', row=rm.row) }}";
   const ROW  = {{ rm.row }};
   const $ = s => document.querySelector(s);
   const esc = s => (s == null ? "" : String(s)).replace(/[&<>"']/g,
     c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
   // ---- tabs -------------------------------------------------------------
-  const PANES = {near:"#pane-near", search:"#pane-search", browse:"#pane-browse"};
+  const PANES = {near:"#pane-near", search:"#pane-search", browse:"#pane-browse",
+                 all:"#pane-all"};
   function show(mode){
     for(const [m, sel] of Object.entries(PANES)) $(sel).hidden = (m !== mode);
     document.querySelectorAll("#picker-tabs a").forEach(a =>
       a.classList.toggle("on", a.dataset.mode === mode));
     if(mode === "search") $("#q").focus();
     if(mode === "browse" && !browsed){ browsed = true; browse(START); }
+    if(mode === "all"){ if(!allLoaded){ allLoaded = true; loadAll(1); } $("#all-q").focus(); }
   }
   document.querySelectorAll("#picker-tabs a").forEach(a =>
     a.onclick = e => { e.preventDefault(); show(a.dataset.mode); });
   document.querySelectorAll("[data-goto]").forEach(a =>
     a.onclick = e => { e.preventDefault(); show(a.dataset.goto); });
 
-  // ---- one result row, shared by search + browse -------------------------
-  // A PDF the classifier didn't call an invoice is still bindable — that is very
-  // often exactly why this row went unmatched — but it must say so before you commit.
-  function rowHtml(h){
-    const conf = h.confidence < 0.6 ? "bad" : h.confidence < 0.8 ? "warn" : "ok";
-    const warn = h.is_invoice ? "" :
-      `<span class="pill warn" title="the scan classified this as '${esc(h.doc_type)}'. Binding it marks it an invoice.">not detected as an invoice</span>`;
-    const taken = (h.gstr_row && h.gstr_row !== ROW)
-      ? `<span class="pill info" title="already satisfies B2B row ${h.gstr_row}">row ${h.gstr_row}</span>` : "";
-    const score = h.score ? `<span class="pill ${h.score>=85?"ok":h.score>=70?"warn":"info"}">${Math.round(h.score)}%</span>` : "";
-    return `<tr>
-      <td class="mono">${esc(h.invoice_id || h.filename)}<div class="muted" style="font-size:11.5px">${esc(h.folder || "—")}</div></td>
-      <td class="mono muted">${esc(h.gstin || "—")}</td>
-      <td class="muted">${esc(h.vendor || h.company || "—")}</td>
-      <td><span class="pill ${conf}">${h.confidence.toFixed(2)}</span> ${warn} ${taken}</td>
-      <td>${score}</td>
-      <td class="right" style="white-space:nowrap">
-        <a class="btn ghost sm" href="/doc/${esc(h.id)}">Preview</a>
-        <form method="post" action="${BIND}" style="display:inline" data-busy="Binding…"
-              data-confirm="${h.is_invoice ? "" : esc(h.filename)}">
-          <input type="hidden" name="doc_id" value="${esc(h.id)}">
-          <button class="btn sm" type="submit">Bind</button>
-        </form>
-      </td></tr>`;
-  }
-  // Delegated, not an inline onsubmit: an apostrophe in a filename would be
-  // HTML-unescaped straight back into the middle of the handler's string literal.
-  document.addEventListener("submit", e => {
-    const name = e.target.dataset && e.target.dataset.confirm;
-    if(name && !confirm(
-        `${name} was not detected as an invoice. Bind it to B2B row ${ROW} and treat it as one?`))
-      e.preventDefault();
-  });
-  const table = hits => hits.length
-    ? `<table><tr><th>file / folder</th><th>GSTIN</th><th>vendor</th><th>status</th>
-         <th>match</th><th></th></tr>${hits.map(rowHtml).join("")}</table>`
-    : `<div class="card"><span class="pill info">nothing here</span> No PDF matches.</div>`;
+  // Candidate rows + the bind-confirm live in window.LINK (base.html), shared with
+  // the inline resolver on the review rows tab. The arrow ignores map's index arg,
+  // so `files.map(rowHtml)` still binds against ROW, not the array index.
+  const rowHtml = h => LINK.rowHtml(h, ROW);
+  const table = hits => LINK.resultsTable(hits, ROW);
 
   // ---- search + autocomplete --------------------------------------------
   const q = $("#q"), ac = $("#ac");
@@ -236,11 +231,21 @@
     UI.armForms($("#search-results"));    // the Bind forms here are built by JS
   }
   q.oninput = () => { clearTimeout(timer); timer = setTimeout(() => search(true), 140); };
+  // The webview fires no `input` for a paste; run the search a tick later, once the
+  // pasted value has landed, so pasting a path/number actually searches.
+  q.addEventListener("paste", () => { clearTimeout(timer); setTimeout(() => search(true), 0); });
   q.onkeydown = e => {
+    // This input is in no <form>, but the webview still treats Enter as a submit and
+    // reloads the page — which wiped what you just typed. Always swallow it.
+    if(e.key === "Enter"){
+      e.preventDefault();
+      if(!ac.hidden && sel >= 0){ pick(); }
+      else { ac.hidden = true; clearTimeout(timer); search(false); }
+      return;
+    }
     if(ac.hidden) return;
     if(e.key === "ArrowDown"){ e.preventDefault(); sel = Math.min(sel + 1, Math.min(hits.length, 8) - 1); drawAc(); }
     else if(e.key === "ArrowUp"){ e.preventDefault(); sel = Math.max(sel - 1, -1); drawAc(); }
-    else if(e.key === "Enter" && sel >= 0){ e.preventDefault(); pick(); }
     else if(e.key === "Escape"){ ac.hidden = true; }
   };
   document.addEventListener("click", e => {
@@ -270,14 +275,13 @@
     const folders = b.folders.map(f => `
       <tr class="folder" data-p="${esc(f.path.join("/"))}">
         <td>📁 ${esc(f.name)}</td>
-        <td class="muted" colspan="4">${f.pdfs} PDF${f.pdfs === 1 ? "" : "s"}${f.invoices ? ` · ${f.invoices} detected invoice${f.invoices === 1 ? "" : "s"}` : ""}</td>
+        <td class="muted" colspan="6">${f.pdfs} PDF${f.pdfs === 1 ? "" : "s"}${f.invoices ? ` · ${f.invoices} detected invoice${f.invoices === 1 ? "" : "s"}` : ""}</td>
         <td class="right muted">open →</td></tr>`).join("");
 
     $("#browse-results").innerHTML =
       (!b.folders.length && !b.files.length)
         ? `<div class="card"><span class="pill info">empty</span> No PDFs under this folder.</div>`
-        : `<table><tr><th>file / folder</th><th>GSTIN</th><th>vendor</th><th>status</th>
-             <th></th><th></th></tr>${folders}${b.files.map(rowHtml).join("")}</table>`;
+        : `<table>${LINK.HEADER}${folders}${b.files.map(rowHtml).join("")}</table>`;
 
     $("#browse-results").querySelectorAll("tr.folder").forEach(tr =>
       tr.onclick = () => browse(tr.dataset.p));
@@ -289,6 +293,51 @@
   }
   document.querySelectorAll("[data-jump]").forEach(b =>
     b.onclick = () => { show("browse"); browsed = true; browse(b.dataset.jump); });
+
+  // ---- flat browse of every PDF (filename / path / content) --------------
+  // The exhaustive counterpart to the ranked search: a plain, paginated list of
+  // all PDFs, with one box that greps filename, path AND the extracted text.
+  let allLoaded = false, allPage = 1, allTimer = null;
+  const allQ = $("#all-q");
+
+  async function loadAll(page){
+    allPage = Math.max(1, page || 1);
+    const s = allQ.value.trim();
+    $("#all-results").innerHTML = `<div class="card"><span class="spin"></span> Loading…</div>`;
+    $("#all-pager").innerHTML = "";
+    let j;
+    try{ j = await fetch(`/api/link/all?page=${allPage}&q=` + encodeURIComponent(s)).then(x => x.json()); }
+    catch(e){ $("#all-results").innerHTML = `<div class="banner bad">Could not load PDFs: ${esc(e)}</div>`; return; }
+    if(allQ.value.trim() !== s) return;          // a newer keystroke already won
+    $("#all-results").innerHTML =
+      `<div class="muted" style="margin-bottom:6px">${(j.total||0).toLocaleString()} PDF${j.total === 1 ? "" : "s"}${s ? " matching" : ""}</div>`
+      + table(j.files || []);
+    UI.armForms($("#all-results"));
+    drawPager(j.page, j.pages);
+  }
+
+  function drawPager(page, pages){
+    const p = $("#all-pager");
+    if(!pages || pages <= 1){ p.innerHTML = ""; return; }
+    p.innerHTML =
+      `<button class="btn ghost sm" ${page <= 1 ? "disabled" : ""} data-pg="${page - 1}">← Prev</button>
+       <span class="info">Page ${page} of ${pages}</span>
+       <button class="btn ghost sm" ${page >= pages ? "disabled" : ""} data-pg="${page + 1}">Next →</button>`;
+    p.querySelectorAll("[data-pg]").forEach(b =>
+      b.onclick = () => { if(!b.disabled) loadAll(+b.dataset.pg); });
+  }
+
+  // Debounced: a content grep over the whole corpus is heavier than the ranked
+  // search, so wait a beat longer before firing, and always reset to page 1.
+  allQ.oninput = () => { clearTimeout(allTimer); allTimer = setTimeout(() => loadAll(1), 220); };
+  // The webview fires no `input` for a paste, so pasting an invoice number here did
+  // nothing; catch it explicitly once the value has landed.
+  allQ.addEventListener("paste", () => { clearTimeout(allTimer); setTimeout(() => loadAll(1), 0); });
+  // No <form> wraps this input, but the webview still fires a page-reloading submit
+  // on Enter — which is exactly the "it refreshed and my text vanished" report.
+  allQ.addEventListener("keydown", e => {
+    if(e.key === "Enter"){ e.preventDefault(); clearTimeout(allTimer); loadAll(1); }
+  });
 
   // ?q= / ?tab= pick the opening pane, so a reload after a bind comes back to the
   // way you were looking for the file rather than dumping you on the near-misses.

@@ -188,3 +188,55 @@ def walk(root: Path, settings: Settings = DEFAULTS,
                 size_bytes=size,
                 info=info_base.model_copy(deep=True),
             )
+
+
+def _page_count(path: str) -> Optional[int]:
+    """Number of pages in a PDF, or None if it can't be opened.
+
+    Cheap: PyMuPDF parses only the xref/page tree — no content streams, no
+    rasterisation — so it is ~an order cheaper than the extract stage. Kept OUT of
+    ``walk()`` (which never opens PDFs — ``test_scope``'s fixtures are deliberately
+    invalid PDFs) and confined to the explode wrapper below.
+    """
+    import fitz  # local import: walk() must stay open-less
+
+    try:
+        with fitz.open(path) as pdf:
+            return pdf.page_count
+    except Exception:
+        return None
+
+
+def walk_pages(root: Path, settings: Settings = DEFAULTS,
+               control: Optional[RunControl] = None) -> Iterator[Document]:
+    """Like :func:`walk`, but explode a multi-page PDF into one seed per page.
+
+    A single PDF can bundle several invoices; each page is treated as its own
+    invoice (assumption: no invoice spans two pages). Fan-out has to happen here on
+    the generator side, because the pipeline is strictly one-doc-in → one-doc-out
+    per stage. Each page seed carries a page-suffixed ``source_key`` (so the id,
+    checkpoint skip-list and dedup all stay per-page unique) and ``page_index=k``.
+
+    Single-page files — and the whole ``explode_pages=False`` path — yield the
+    original seed **unchanged** (same ``source_key``/``id``, ``page_index=None``),
+    so they remain byte-identical to ``walk()``.
+    """
+    for seed in walk(root, settings, control):
+        if not settings.explode_pages:
+            yield seed
+            continue
+        if control is not None:
+            control.gate()          # stay stoppable between files during explosion
+        n = _page_count(seed.path)
+        if n is None or n <= 1:      # unreadable or single page → untouched seed
+            yield seed
+            continue
+        for k in range(n):
+            yield seed_document(
+                source_key=f"{seed.source_key}#page={k}",
+                path=seed.path,
+                filename=seed.filename,
+                size_bytes=seed.size_bytes,
+                info=seed.path_info.model_copy(deep=True),
+                page_index=k,
+            )

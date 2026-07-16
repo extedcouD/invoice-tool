@@ -96,6 +96,18 @@ def _otsu_threshold(arr: np.ndarray) -> float:
     return threshold
 
 
+def write_page_pdf(src: str, page_index: int, dest) -> None:
+    """Write a single page of ``src`` as a standalone 1-page PDF at ``dest``.
+
+    Used when copying a page-invoice (one page of a bundled multi-invoice PDF) to a
+    deliverable, so the flat linked copy and the review copy are just that invoice's
+    page rather than the whole multi-invoice file.
+    """
+    with fitz.open(src) as s, fitz.open() as out:
+        out.insert_pdf(s, from_page=page_index, to_page=page_index)
+        out.save(str(dest))
+
+
 class PdfTextSource(TextSource):
     def __init__(self, settings: Settings = DEFAULTS,
                  file_source: FileSource | None = None,
@@ -229,9 +241,21 @@ class PdfTextSource(TextSource):
         try:
             with fitz.open(local) as pdf:
                 doc.page_count = pdf.page_count
+                # A page-invoice reads ONLY its own page; a whole-file doc reads and
+                # concatenates every page, exactly as before.
+                if doc.page_index is not None:
+                    if doc.page_index >= pdf.page_count:
+                        doc.add_flag(
+                            "page_out_of_range",
+                            f"page {doc.page_index + 1} of {pdf.page_count} "
+                            "(source file changed since discovery?)")
+                        return "", "none"
+                    pages = [pdf[doc.page_index]]
+                else:
+                    pages = list(pdf)
                 native_parts: list[str] = []
                 used_ocr = False
-                for page in pdf:
+                for page in pages:
                     txt = page.get_text() or ""
                     if len(txt.strip()) >= self.s.min_text_chars:
                         native_parts.append(txt)

@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as m %}
 {% block title %}{{ d.fields.invoice_id or d.id }} — review{% endblock %}
 {% block body %}
 <p><a href="{{ url_for('review') }}">← review queue</a></p>
@@ -65,24 +66,15 @@
     <h2>Fields <span class="muted">(edit &amp; confirm — saving re-runs the GSTR match)</span></h2>
     <form method="post" action="{{ url_for('confirm', doc_id=d.id) }}" data-busy="Saving…">
       <div class="grid" style="grid-template-columns:1fr 1fr;gap:10px">
-        <div><label>invoice_id (filename)</label>
-          <input name="invoice_id" value="{{ d.fields.invoice_id or '' }}"></div>
-        <div><label>company (folder)</label>
-          <input name="company" value="{{ d.path_info.company or '' }}"></div>
-        <div><label>vendor name (PDF)</label>
-          <input name="vendor_name_pdf" value="{{ d.fields.vendor_name_pdf or '' }}"></div>
-        <div><label>vendor GSTIN</label>
-          <input name="vendor_gstin" value="{{ d.fields.vendor_gstin or '' }}"></div>
-        <div><label>invoice date</label>
-          <input name="invoice_date" value="{{ d.fields.invoice_date or d.fields.invoice_date_raw or '' }}"></div>
-        <div><label>taxable value</label>
-          <input name="taxable_value" value="{{ d.fields.taxable_value if d.fields.taxable_value is not none else '' }}"></div>
-        <div><label>total value</label>
-          <input name="total_value" value="{{ d.fields.total_value if d.fields.total_value is not none else '' }}"></div>
-        <div><label>bill-to name</label>
-          <input name="bill_to_name" value="{{ d.fields.bill_to_name or '' }}"></div>
-        <div><label>bill-to GSTIN</label>
-          <input name="bill_to_gstin" value="{{ d.fields.bill_to_gstin or '' }}"></div>
+        {{ m.field("invoice_id", "invoice_id (filename)", d.fields.invoice_id or '') }}
+        {{ m.field("company", "company (folder)", d.path_info.company or '') }}
+        {{ m.field("vendor_name_pdf", "vendor name (PDF)", d.fields.vendor_name_pdf or '') }}
+        {{ m.field("vendor_gstin", "vendor GSTIN", d.fields.vendor_gstin or '') }}
+        {{ m.field("invoice_date", "invoice date", d.fields.invoice_date or d.fields.invoice_date_raw or '') }}
+        {{ m.field("taxable_value", "taxable value", d.fields.taxable_value if d.fields.taxable_value is not none else '') }}
+        {{ m.field("total_value", "total value", d.fields.total_value if d.fields.total_value is not none else '') }}
+        {{ m.field("bill_to_name", "bill-to name", d.fields.bill_to_name or '') }}
+        {{ m.field("bill_to_gstin", "bill-to GSTIN", d.fields.bill_to_gstin or '') }}
       </div>
       <div style="margin-top:12px"><button class="btn" type="submit" {{ 'disabled' if locked }}>✓ Confirm &amp; save</button></div>
     </form>

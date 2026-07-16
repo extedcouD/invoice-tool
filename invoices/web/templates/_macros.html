@@ -1,0 +1,20 @@
+{# Reusable bits shared across review templates. #}
+
+{# A small copy-to-clipboard button placed next to a value the reviewer transcribes
+   (invoice number, GSTIN, date, amounts). The click is handled by a single
+   delegated listener in base.html (window.UI), which works in the native desktop
+   window where there is no right-click "Copy". Renders nothing for an empty value. #}
+{% macro copyable(value) -%}
+{%- if value %}<button type="button" class="copybtn" data-copy="{{ value }}" title="Copy">⧉</button>{% endif -%}
+{%- endmacro %}
+
+{# An editable review field (name + label + value) with a copy button that grabs the
+   input's live value. `data-copy-prev` (handled in base.html) reads the sibling input. #}
+{% macro field(name, label, value) -%}
+<div><label>{{ label }}</label>
+  <div class="field-copy">
+    <input name="{{ name }}" value="{{ value }}">
+    <button type="button" class="copybtn" data-copy-prev title="Copy">⧉</button>
+  </div>
+</div>
+{%- endmacro %}

@@ -137,7 +137,8 @@ class RunController:
             # input is (root, fy): an all-years run and a one-year run over the same
             # tree are different corpora and must never resume each other.
             existing = (None if continue_store
-                        else RunStore.find_resumable(self.output_root, root_key, fy=fy))
+                        else RunStore.find_resumable(self.output_root, root_key, fy=fy,
+                                                     pages=run_settings.explode_pages))
             self.store = continue_store or existing or RunStore.new(self.output_root, label=fy)
             self.resumed = continue_store is not None or existing is not None
             self.result = None

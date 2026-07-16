@@ -120,6 +120,40 @@ def test_browse_an_unknown_folder_is_empty_not_an_error():
     assert b["folders"] == [] and b["files"] == []
 
 
+# ---- flat, paginated, content-searchable listing -------------------------
+def test_flat_lists_every_pdf_once_across_pages():
+    idx = index()
+    seen: list[str] = []
+    for pg in (1, 2, 3):
+        r = idx.flat(page=pg, page_size=2)
+        assert r["total"] == len(TREE) and r["pages"] == 3
+        seen += [h.doc.id for h in r["files"]]
+    assert sorted(seen) == sorted(d.id for d in TREE)   # every doc, exactly once
+    assert len(set(seen)) == len(TREE)
+
+
+def test_flat_query_matches_path_or_filename():
+    idx = index()
+    assert [h.doc.id for h in idx.flat("zephyr")["files"]] == ["d4"]
+    assert [h.doc.id for h in idx.flat("approval-note")["files"]] == ["d5"]
+
+
+def test_flat_searches_inside_pdf_content():
+    """The flat browse greps the extracted body, not just path + fields — a term
+    that appears *only* inside the PDF still finds the file."""
+    body = doc("body", "Misc/scan-99.pdf")
+    body.text = "Purchase Order 4471 for widgets"
+    idx = PathIndex(TREE + [body], ROOT)
+    assert [h.doc.id for h in idx.flat("4471")["files"]] == ["body"]
+    # multi-word queries AND together over name + path + content
+    assert [h.doc.id for h in idx.flat("widgets misc")["files"]] == ["body"]
+
+
+def test_flat_clamps_an_out_of_range_page():
+    r = index().flat(page=999, page_size=2)
+    assert r["page"] == r["pages"] == 3
+
+
 # ---- folder auto-suggestion ---------------------------------------------
 def test_suggest_folders_from_the_supplier_name():
     """A B2B row names its supplier; the tree is filed by company — so browsing

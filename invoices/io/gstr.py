@@ -26,6 +26,7 @@ copy path source-agnostic.
 """
 from __future__ import annotations
 
+import datetime as dt
 import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +39,7 @@ from openpyxl import load_workbook
 from ..core.interfaces import FileSource
 from ..core.models import Document, LinkStatus, RunResult
 from ..io.excel import _FLAG_FILL, _HEADER_FILL, _HEADER_FONT, _autosize, _style_header
+from ..io.pdf import write_page_pdf
 from ..io.runstore import RunStore
 from ..io.sources import LocalFileSource
 from ..matching import vendor
@@ -46,12 +48,14 @@ DEFAULT_SHEET = "Part A - B2B Invoices"
 DEFAULT_REF_HEADER = "Invoice Ref"
 GSTIN_HEADER = "GSTIN of Supplier"
 INVNO_HEADER = "Invoice Number"
+INVDATE_HEADER = "Invoice Date"
 REPORT_SHEET = "Link Report"
 
 # Row outcomes.
 MATCHED = "matched"
 NOT_FOUND = "not_found"
 AMBIGUOUS = "ambiguous"
+SKIPPED = "skipped"        # the reviewer skipped this supplier's unmatched rows
 
 
 # --------------------------------------------------------------------------- #
@@ -63,8 +67,10 @@ class B2BRow:
     row: int                  # 1-based row number in the sheet
     gstin: str                # raw, as printed
     invoice_no: str           # raw, as printed
-    supplier: str = ""        # display only
+    invoice_date: str = ""    # display only — the date the return prints for this row
+    supplier: str = ""        # display only ("Supplier Trade/Legal Name")
     value: str = ""           # display only
+    existing_ref: str = ""    # a real value already in the 'Invoice Ref' column (rerun)
 
 
 @dataclass
@@ -73,16 +79,20 @@ class RowMatch:
     row: int
     gstin: str
     invoice_no: str
-    status: str                            # matched | not_found | ambiguous
+    status: str                            # matched | not_found | ambiguous | skipped
     doc_id: Optional[str] = None           # the invoice satisfying this row
     candidates: list[str] = field(default_factory=list)   # doc ids, when ambiguous
     manual: bool = False                   # bound by a human, not by the matcher
     supplier: str = ""
     value: str = ""
+    invoice_date: str = ""                 # the date the return prints (display only)
+    existing_ref: str = ""                 # a link value already on the sheet (rerun)
 
     @property
     def unresolved(self) -> bool:
-        return self.status != MATCHED
+        # SKIPPED is a deliberate resolution ("don't chase this supplier"), so it
+        # leaves the human queue just like MATCHED does.
+        return self.status not in (MATCHED, SKIPPED)
 
 
 @dataclass
@@ -99,6 +109,7 @@ class LinkPlan:
             "matched": sum(1 for r in self.rows if r.status == MATCHED),
             "not_found": sum(1 for r in self.rows if r.status == NOT_FOUND),
             "ambiguous": sum(1 for r in self.rows if r.status == AMBIGUOUS),
+            "skipped": sum(1 for r in self.rows if r.status == SKIPPED),
             "unreferenced": len(self.unreferenced),
             "duplicate_filings": self.duplicate_filings,
         }
@@ -131,11 +142,13 @@ class LinkReport:
     matched: int = 0
     not_found: int = 0
     ambiguous: int = 0
+    skipped: int = 0
     copy_failed: int = 0
     duplicate_filings: int = 0
     unreferenced_invoices: int = 0
     unmatched_rows: list = field(default_factory=list)   # (row, gstin, invno)
     ambiguous_rows: list = field(default_factory=list)   # (row, gstin, invno, n)
+    skipped_rows: list = field(default_factory=list)     # (row, gstin, invno, supplier)
     out_path: Path | None = None
     flat_dir: Path | None = None
 
@@ -145,6 +158,36 @@ class LinkReport:
 # --------------------------------------------------------------------------- #
 def _s(v) -> str:
     return "" if v is None else str(v).strip()
+
+
+def _date_str(v) -> str:
+    """A cell's date as a plain ``YYYY-MM-DD`` string.
+
+    openpyxl (``data_only=True``) hands back real ``datetime`` objects for
+    date-typed cells; printing those verbatim would put ``00:00:00`` in the
+    reviewer's face, so normalize to the date. Anything else is passed through
+    as-is (a return may store the date as free text)."""
+    if isinstance(v, dt.datetime):
+        return v.date().isoformat()
+    if isinstance(v, dt.date):
+        return v.isoformat()
+    return _s(v)
+
+
+def norm_supplier(s: str) -> str:
+    """Canonical key for a supplier trade/legal name: trim, collapse inner
+    whitespace, casefold. Two rows that name the same entity with different
+    spacing/case skip together."""
+    return re.sub(r"\s+", " ", (s or "").strip()).casefold()
+
+
+# Values the tool itself writes into the 'Invoice Ref' column. On a rerun these are
+# NOT a human's link — only a real filename counts as a pre-filled ref to preserve.
+def _is_real_ref(v: str) -> bool:
+    t = (v or "").strip().lower()
+    if not t or t in ("not found", "copy failed", "skipped"):
+        return False
+    return not t.startswith("ambiguous")
 
 
 def _sanitize(s: str) -> str:
@@ -208,8 +251,15 @@ def _pick_best(cands: list[Document]) -> Document:
 # 1 · read the return
 # --------------------------------------------------------------------------- #
 def read_b2b_rows(gstr_path: Path | str,
-                  sheet_name: str = DEFAULT_SHEET) -> list[B2BRow]:
-    """Parse the B2B sheet once. Read-only — the template is never modified."""
+                  sheet_name: str = DEFAULT_SHEET,
+                  ref_header: str = DEFAULT_REF_HEADER) -> list[B2BRow]:
+    """Parse the B2B sheet once. Read-only — the template is never modified.
+
+    On a **rerun** the sheet may already carry an ``Invoice Ref`` column (from a
+    prior export or hand-editing); a real value there is captured as
+    ``B2BRow.existing_ref`` so the write step can preserve it instead of stamping a
+    fresh sentinel over a human's link (see ``write_linked``).
+    """
     wb = load_workbook(Path(gstr_path), read_only=True, data_only=True)
     try:
         if sheet_name not in wb.sheetnames:
@@ -231,6 +281,10 @@ def read_b2b_rows(gstr_path: Path | str,
         # display-only extras, best effort
         si = next((i for h, i in headers.items() if "trade" in h or "supplier name" in h), None)
         vi = next((i for h, i in headers.items() if "invoice value" in h), None)
+        di = headers.get(INVDATE_HEADER.lower())
+        if di is None:
+            di = next((i for h, i in headers.items() if "invoice date" in h), None)
+        ri = headers.get(ref_header.lower())   # existing link column (rerun), if any
 
         out: list[B2BRow] = []
         for n, values in enumerate(rows_iter, start=2):
@@ -238,10 +292,13 @@ def read_b2b_rows(gstr_path: Path | str,
             invno = _s(values[ni]) if ni < len(values) else ""
             if not gstin and not invno:
                 continue  # trailing/blank row
+            existing = _s(values[ri]) if ri is not None and ri < len(values) else ""
             out.append(B2BRow(
                 row=n, gstin=gstin, invoice_no=invno,
+                invoice_date=_date_str(values[di]) if di is not None and di < len(values) else "",
                 supplier=_s(values[si]) if si is not None and si < len(values) else "",
                 value=_s(values[vi]) if vi is not None and vi < len(values) else "",
+                existing_ref=existing if _is_real_ref(existing) else "",
             ))
         return out
     finally:
@@ -252,14 +309,20 @@ def read_b2b_rows(gstr_path: Path | str,
 # 2 · match (pure)
 # --------------------------------------------------------------------------- #
 def match(rows: Iterable[B2BRow], invoices: Iterable[Document],
-          manual: dict[int, str] | None = None) -> LinkPlan:
+          manual: dict[int, str] | None = None,
+          skipped: Iterable[str] | None = None) -> LinkPlan:
     """Resolve every B2B row to an invoice. No I/O — safe to re-run on every edit.
 
     ``manual`` maps a sheet row number to a doc id a human bound by hand; it wins
     over whatever the matcher would have decided (including over "not found").
+
+    ``skipped`` is a set of supplier trade/legal names the reviewer chose to skip;
+    any of their rows the matcher *can't* resolve become ``SKIPPED`` (a match still
+    wins over a skip), so a whole entity drops out of the queue in one action.
     """
     invoices = list(invoices)
     manual = manual or {}
+    skip_keys = {norm_supplier(s) for s in (skipped or [])}
     by_id = {d.id: d for d in invoices}
     by_key, by_invno = _build_index(invoices)
 
@@ -273,7 +336,9 @@ def match(rows: Iterable[B2BRow], invoices: Iterable[Document],
         if forced and forced in by_id:
             rm = RowMatch(row=r.row, gstin=r.gstin, invoice_no=r.invoice_no,
                           status=MATCHED, doc_id=forced, manual=True,
-                          supplier=r.supplier, value=r.value)
+                          supplier=r.supplier, value=r.value,
+                          invoice_date=r.invoice_date,
+                          existing_ref=r.existing_ref)
             plan.rows.append(rm)
             plan.by_doc[forced] = rm
             matched_ids.add(forced)
@@ -283,7 +348,8 @@ def match(rows: Iterable[B2BRow], invoices: Iterable[Document],
         if not cands:
             plan.rows.append(RowMatch(
                 row=r.row, gstin=r.gstin, invoice_no=r.invoice_no,
-                status=NOT_FOUND, supplier=r.supplier, value=r.value))
+                status=NOT_FOUND, supplier=r.supplier, value=r.value,
+                invoice_date=r.invoice_date, existing_ref=r.existing_ref))
             continue
 
         # >1 candidate: the same invoice filed twice (a dup — pick the best copy)
@@ -294,7 +360,8 @@ def match(rows: Iterable[B2BRow], invoices: Iterable[Document],
             plan.rows.append(RowMatch(
                 row=r.row, gstin=r.gstin, invoice_no=r.invoice_no,
                 status=AMBIGUOUS, candidates=[d.id for d in cands],
-                supplier=r.supplier, value=r.value))
+                supplier=r.supplier, value=r.value,
+                invoice_date=r.invoice_date, existing_ref=r.existing_ref))
             continue
 
         doc = _pick_best(cands)
@@ -303,10 +370,18 @@ def match(rows: Iterable[B2BRow], invoices: Iterable[Document],
         rm = RowMatch(row=r.row, gstin=r.gstin, invoice_no=r.invoice_no,
                       status=MATCHED, doc_id=doc.id,
                       candidates=[d.id for d in cands] if len(cands) > 1 else [],
-                      supplier=r.supplier, value=r.value)
+                      supplier=r.supplier, value=r.value,
+                      invoice_date=r.invoice_date, existing_ref=r.existing_ref)
         plan.rows.append(rm)
         plan.by_doc[doc.id] = rm
         matched_ids.add(doc.id)
+
+    # A skipped supplier's *unmatched* rows (not_found / ambiguous) become SKIPPED,
+    # so they leave the queue; matched rows are untouched.
+    if skip_keys:
+        for rm in plan.rows:
+            if rm.unresolved and norm_supplier(rm.supplier) in skip_keys:
+                rm.status = SKIPPED
 
     plan.unreferenced = [d.id for d in invoices if d.id not in matched_ids]
     return plan
@@ -429,29 +504,43 @@ def write_linked(result: RunResult, plan: LinkPlan, gstr_path: Path, store: RunS
                      unreferenced_invoices=counts["unreferenced"])
     used_names: set[str] = set()
 
+    def _unresolved(rm, sentinel: str) -> None:
+        """Write the cell for a row with no fresh match. A pre-filled link a human
+        put there (rerun) is preserved verbatim; otherwise the sentinel is stamped."""
+        cell = ws.cell(row=rm.row, column=ref_col)
+        if _is_real_ref(rm.existing_ref):
+            cell.value = rm.existing_ref
+        else:
+            _flag_cell(cell, sentinel)
+
     # ---- pass 1: decide every row, serially. No I/O, so the flat-name uniqueness
     # check stays deterministic and openpyxl is only touched from this thread.
     to_copy: list[tuple] = []          # (rm, doc, flat name)
     for rm in plan.rows:
+        if rm.status == SKIPPED:
+            rep.skipped += 1
+            rep.skipped_rows.append((rm.row, rm.gstin, rm.invoice_no, rm.supplier))
+            _unresolved(rm, "SKIPPED")
+            continue
+
         if rm.status == NOT_FOUND:
             rep.not_found += 1
             rep.unmatched_rows.append((rm.row, rm.gstin, rm.invoice_no))
-            _flag_cell(ws.cell(row=rm.row, column=ref_col), "NOT FOUND")
+            _unresolved(rm, "NOT FOUND")
             continue
 
         if rm.status == AMBIGUOUS:
             rep.ambiguous += 1
             rep.ambiguous_rows.append(
                 (rm.row, rm.gstin, rm.invoice_no, len(rm.candidates)))
-            _flag_cell(ws.cell(row=rm.row, column=ref_col),
-                       f"AMBIGUOUS ({len(rm.candidates)})")
+            _unresolved(rm, f"AMBIGUOUS ({len(rm.candidates)})")
             continue
 
         doc = by_id.get(rm.doc_id or "")
         if doc is None:  # a bound doc that is no longer an invoice (rejected in review)
             rep.not_found += 1
             rep.unmatched_rows.append((rm.row, rm.gstin, rm.invoice_no))
-            _flag_cell(ws.cell(row=rm.row, column=ref_col), "NOT FOUND")
+            _unresolved(rm, "NOT FOUND")
             continue
 
         name = _flat_name(rm.gstin, rm.invoice_no)
@@ -472,9 +561,14 @@ def write_linked(result: RunResult, plan: LinkPlan, gstr_path: Path, store: RunS
         except Exception:
             return rm, name, False
         try:
-            shutil.copy2(local, flat_dir / name)
+            # A page-invoice writes just its own page as a 1-page PDF, so the flat
+            # copy is one invoice; a whole-file doc is a straight byte copy.
+            if doc.page_index is not None:
+                write_page_pdf(local, doc.page_index, flat_dir / name)
+            else:
+                shutil.copy2(local, flat_dir / name)
             return rm, name, True
-        except OSError:
+        except Exception:
             return rm, name, False
         finally:
             file_source.cleanup(doc, local)
@@ -521,6 +615,7 @@ def _write_report_sheet(wb, rep: LinkReport, gstr_path: Path, sheet_name: str) -
         ("matched", rep.matched),
         ("not_found", rep.not_found),
         ("ambiguous", rep.ambiguous),
+        ("skipped", rep.skipped),
         ("copy_failed", rep.copy_failed),
         ("duplicate_filings", rep.duplicate_filings),
         ("detected_invoices_unreferenced", rep.unreferenced_invoices),
@@ -541,6 +636,13 @@ def _write_report_sheet(wb, rep: LinkReport, gstr_path: Path, sheet_name: str) -
         for row, gstin, invno, ncand in rep.ambiguous_rows:
             ws.append([row, gstin, invno, ncand])
 
+    if rep.skipped_rows:
+        ws.append([])
+        ws.append(["SKIPPED — supplier skipped by the reviewer"])
+        ws.append(["row", "GSTIN of Supplier", "Invoice Number", "Supplier"])
+        for row, gstin, invno, supplier in rep.skipped_rows:
+            ws.append([row, gstin, invno, supplier])
+
     _autosize(ws, ["metric", "value", "col3", "col4"])
 
 
@@ -557,9 +659,10 @@ def link_gstr(result: RunResult, gstr_path: Path, store: RunStore,
     Manual bindings default to the ones saved in the run dir, so re-linking from
     the CLI doesn't silently discard rows a human already resolved in the review UI.
     """
-    rows = read_b2b_rows(gstr_path, sheet_name)
+    rows = read_b2b_rows(gstr_path, sheet_name, ref_header)
     plan = match(rows, result.invoices(),
-                 store.manual_links() if manual is None else manual)
+                 store.manual_links() if manual is None else manual,
+                 skipped=store.skipped_suppliers())
     apply_plan(result, plan)
     store.save_link(plan)
     store.update_meta(gstr_path=str(gstr_path))

@@ -192,6 +192,10 @@ def main() -> None:
             window = webview.create_window(
                 "Invoice → GSTR Linker", url, js_api=api,
                 width=1180, height=820, min_size=(920, 660),
+                # Let the reviewer select/copy field text in the native window;
+                # off by default in the WKWebView/EdgeChromium backends. The
+                # explicit copy buttons in the UI are the primary path.
+                text_select=True,
             )
             api.window = window
             webview.start()

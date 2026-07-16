@@ -141,7 +141,7 @@ def cmd_link_gstr(args) -> None:
                     sheet_name=args.sheet, ref_header=args.ref_column)
     print(f"\nlinked {rep.matched}/{rep.total} B2B rows "
           f"({rep.not_found} NOT FOUND, {rep.ambiguous} ambiguous, "
-          f"{rep.copy_failed} copy-failed)")
+          f"{rep.skipped} skipped, {rep.copy_failed} copy-failed)")
     print(f"  workbook: {rep.out_path}")
     print(f"  invoices: {rep.flat_dir}  ({rep.matched} files)")
     if rep.duplicate_filings:

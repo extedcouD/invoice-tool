@@ -177,6 +177,11 @@ class Settings:
     review_confidence_threshold: float = REVIEW_CONFIDENCE_THRESHOLD
     workers: int = 1  # >1 maps documents across a thread pool (OCR shells out to tesseract)
     ocr_enabled: bool = True
+    # Treat each page of a multi-page PDF as its own invoice (a single PDF can
+    # bundle several; no invoice spans two pages). Always on in the product — this
+    # is a knob only so tests can exercise the single-Document-per-file path.
+    # Single-page PDFs are byte-identical either way.
+    explode_pages: bool = True
 
 
 DEFAULTS = Settings()

@@ -123,6 +123,21 @@ def test_a_legacy_run_without_an_fy_key_still_resumes(tmp_path: Path) -> None:
     assert RunStore.find_resumable(out, "k", fy="FY 22-23") is None
 
 
+def test_page_explosion_is_part_of_the_resume_identity(tmp_path: Path) -> None:
+    """A page-exploding run must never reopen a whole-file checkpoint, or the ledger
+    would mix a stale whole-file doc with its N page docs. The marker (`pages`) is
+    matched only when the caller asks; a pre-feature run (no marker) reads as False."""
+    out = tmp_path / "out"
+    _incomplete_run(out, "20260101-000000",
+                    {"root": "kp", "fy": None, "pages": True, "complete": False})
+    _incomplete_run(out, "20260101-000001",         # pre-feature, no `pages` key
+                    {"root": "kw", "fy": None, "complete": False})
+
+    assert RunStore.find_resumable(out, "kp", pages=True) is not None
+    assert RunStore.find_resumable(out, "kw", pages=True) is None     # legacy refused
+    assert RunStore.find_resumable(out, "kw") is not None             # no filter -> resumes
+
+
 def test_the_run_dir_carries_the_year(tmp_path: Path) -> None:
     """So several per-year outputs are tellable apart on disk, timestamp still first
     (a lexical sort of run_* must stay chronological)."""
