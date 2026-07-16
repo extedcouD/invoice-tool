@@ -52,17 +52,45 @@ def _resolve_fy(root: Path, fy: str | None) -> str | None:
 
 
 def cmd_scan(args) -> None:
-    root = Path(args.root)
-    fy = _resolve_fy(root, getattr(args, "fy", None))
-    settings = replace(
-        DEFAULTS,
-        workers=args.workers,
-        ocr_enabled=not args.no_ocr,
-        fy_scope=fy,
-    )
-    gstr = Path(args.gstr) if getattr(args, "gstr", None) else None
-    store, result = run_scan(root, Path(args.out), settings,
-                             quiet=args.quiet, gstr_path=gstr)
+    cont = getattr(args, "continue_run", None)
+    if bool(cont) == bool(args.root):
+        sys.exit("give exactly one of --root (fresh scan) or --continue-run RUNDIR "
+                 "(append new PDFs to an existing run)")
+
+    if cont:
+        # Continue an existing run: its root/fy/gstr come from run_meta.json, and the
+        # explicit store bypasses the completeness gate so a *finished* run can be
+        # extended. The pipeline skips every source_key already in the checkpoint, so
+        # only newly-added PDFs are processed.
+        try:
+            store = RunStore.open_existing(cont)
+        except ValueError as exc:
+            sys.exit(str(exc))
+        d = store.describe()
+        root = Path(d["root"])
+        fy = d["fy"]
+        gstr = Path(d["gstr"]) if d["gstr"] else None
+        if not d["tree_exists"]:
+            print(f"warning: the recorded tree {d['root']!r} no longer exists — matches "
+                  "are keyed on absolute paths, so a moved tree reprocesses everything.")
+        print(f"continuing run {store.run_id}: {d['done']} file(s) already done "
+              f"→ scanning for new files" + (f"   [{fy} only]" if fy else ""))
+        settings = replace(DEFAULTS, workers=args.workers,
+                           ocr_enabled=not args.no_ocr, fy_scope=fy)
+        store, result = run_scan(root, Path(args.out), settings, store=store,
+                                 root_key=d["root"], quiet=args.quiet, gstr_path=gstr)
+    else:
+        root = Path(args.root)
+        fy = _resolve_fy(root, getattr(args, "fy", None))
+        settings = replace(
+            DEFAULTS,
+            workers=args.workers,
+            ocr_enabled=not args.no_ocr,
+            fy_scope=fy,
+        )
+        gstr = Path(args.gstr) if getattr(args, "gstr", None) else None
+        store, result = run_scan(root, Path(args.out), settings,
+                                 quiet=args.quiet, gstr_path=gstr)
     s = result.summary()
     print(f"\nrun: {store.dir}" + (f"   [{fy} only]" if fy else ""))
     print(f"  detections: {store.detections_path}")
@@ -113,7 +141,7 @@ def cmd_link_gstr(args) -> None:
                     sheet_name=args.sheet, ref_header=args.ref_column)
     print(f"\nlinked {rep.matched}/{rep.total} B2B rows "
           f"({rep.not_found} NOT FOUND, {rep.ambiguous} ambiguous, "
-          f"{rep.copy_failed} copy-failed)")
+          f"{rep.skipped} skipped, {rep.copy_failed} copy-failed)")
     print(f"  workbook: {rep.out_path}")
     print(f"  invoices: {rep.flat_dir}  ({rep.matched} files)")
     if rep.duplicate_filings:
@@ -135,10 +163,17 @@ def build_parser() -> argparse.ArgumentParser:
     web.add_argument("--no-browser", action="store_true", help="don't auto-open a browser")
 
     sc = sub.add_parser("scan", parents=[web], help="scan a folder tree and detect invoices")
-    sc.add_argument("--root", required=True, help="root folder to scan (FY.. tree)")
+    sc.add_argument("--root", help="root folder to scan (FY.. tree). Required unless "
+                                   "--continue-run is given.")
+    sc.add_argument("--continue-run", metavar="RUNDIR",
+                    help="append newly-added PDFs to an existing run dir instead of "
+                         "starting fresh. Root, --fy and --gstr are read from the run's "
+                         "run_meta.json; only files not already processed are scanned, and "
+                         "detections.json + the master are updated in place.")
     sc.add_argument("--fy", help="scan only this financial-year folder, e.g. 'FY 22-23' "
                                  "(default: every FY under --root). One GSTR-2A workbook "
-                                 "covers one year, so scope the run to that year.")
+                                 "covers one year, so scope the run to that year. Ignored "
+                                 "with --continue-run (taken from the run).")
     sc.add_argument("--gstr", help="GSTR-2A workbook to match against (enables the "
                                    "linking review: which B2B rows have no PDF)")
     sc.add_argument("--workers", type=int, default=1)

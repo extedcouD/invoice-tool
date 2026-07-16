@@ -96,11 +96,8 @@ class Document(BaseModel):
     size_bytes: int = 0
 
     # Stable identity of the source bytes, used to skip already-processed files
-    # when a scan resumes ("local:<abs-path>" or "drive:<fileId>@<modifiedTime>").
+    # when a scan resumes ("local:<abs-path>").
     source_key: str = ""
-    # Set only when the source is Google Drive (used to fetch bytes on demand).
-    drive_file_id: Optional[str] = None
-    drive_modified_time: Optional[str] = None
 
     path_info: PathInfo = Field(default_factory=PathInfo)
     doc_type: DocType = DocType.UNKNOWN
@@ -109,6 +106,12 @@ class Document(BaseModel):
     source: TextSourceKind = TextSourceKind.NONE
     text: str = ""
     page_count: int = 0
+    # 0-based page of a multi-page source PDF, set when one PDF bundling several
+    # invoices is exploded into one Document per page. None = the whole file (a
+    # single-page PDF, or splitting off). This is THE discriminator for the
+    # multi-invoice path: extract reads only this page, the id gets a page suffix,
+    # and the deliverable copy is sliced to just this page.
+    page_index: Optional[int] = None
 
     fields: Fields = Field(default_factory=Fields)
 
@@ -132,6 +135,11 @@ class Document(BaseModel):
     @property
     def is_invoice(self) -> bool:
         return self.doc_type == DocType.INVOICE
+
+    @property
+    def is_page_invoice(self) -> bool:
+        """True when this Document is one page of an exploded multi-page PDF."""
+        return self.page_index is not None
 
     @property
     def needs_review(self) -> bool:

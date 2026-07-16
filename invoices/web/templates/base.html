@@ -26,6 +26,8 @@
   .grid{display:grid;gap:14px}
   .cards{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .card.recent-run{transition:border-color .15s}
+  .card.recent-run:hover{border-color:var(--accent)}
   .card .k{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
   .card .v{font-size:26px;font-weight:700;margin-top:4px}
   table{width:100%;border-collapse:collapse;background:var(--panel);
@@ -50,6 +52,15 @@
     border:none;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px}
   .btn.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
   .btn.ghost.sel{border-color:var(--accent);color:var(--accent);font-weight:700}
+  /* "Skip this supplier" is a supplier-level action, not the neutral row-level
+     "Browse folders…" — give it an amber cast so the two never read as the same. */
+  .btn.skip-supplier{border-color:rgba(232,161,60,.55);color:var(--warn);background:rgba(232,161,60,.08)}
+  .btn.skip-supplier:hover{border-color:var(--warn);background:rgba(232,161,60,.16)}
+  /* The one irreversible action in the app (rewrites the workbook, copies every
+     matched PDF) must not read as just another primary button — same reasoning as
+     .btn.skip-supplier above, reusing the same --warn token rather than a new color. */
+  .btn.finish{background:var(--warn);color:#2b1400}
+  .btn.finish:hover{background:#f0ac4c}
   .btn:disabled{opacity:.5;cursor:not-allowed}
   .btn.big{padding:11px 20px;font-size:14px}
   .btn.sm{padding:5px 10px;font-size:12px}
@@ -68,7 +79,7 @@
   @keyframes spin{to{transform:rotate(360deg)}}
   /* a spinner that sits inside a button while its action is in flight */
   .spin.sm{width:11px;height:11px;border-width:2px;vertical-align:-1px;margin-right:4px}
-  /* blocking overlay for the long jobs (export / Drive upload) */
+  /* blocking overlay for the long job (the export) */
   #busy-ov{display:none;position:fixed;inset:0;z-index:50;background:rgba(8,10,14,.72);
     align-items:center;justify-content:center}
   #busy-ov .box{background:var(--panel);border:1px solid var(--line);border-radius:12px;
@@ -81,6 +92,18 @@
     border-radius:7px;padding:7px 9px;font-size:13px;width:100%}
   label{display:block;color:var(--mut);font-size:11px;text-transform:uppercase;
     letter-spacing:.5px;margin:0 0 4px}
+  /* a prominent search box — the reviewer lives in these, so they must not look
+     like an afterthought input. Bigger, with a magnifier and a clear focus ring. */
+  input.searchbar{font-size:15px;padding:12px 14px 12px 42px;border:1.5px solid var(--line);
+    border-radius:10px;background-color:var(--panel2);background-repeat:no-repeat;
+    background-position:15px center;background-size:17px;
+    background-image:url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='24'%20height='24'%20viewBox='0%200%2024%2024'%20fill='none'%20stroke='%239aa4b2'%20stroke-width='2'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Ccircle%20cx='11'%20cy='11'%20r='7'/%3E%3Cline%20x1='21'%20y1='21'%20x2='16.65'%20y2='16.65'/%3E%3C/svg%3E")}
+  input.searchbar:focus{outline:none;border-color:var(--accent);
+    box-shadow:0 0 0 3px rgba(79,156,255,.18)}
+  input.searchbar::placeholder{color:var(--mut)}
+  /* pagination for the flat PDF browse */
+  .pager{display:flex;gap:12px;align-items:center;justify-content:center;margin-top:16px}
+  .pager .info{color:var(--mut);font-size:13px}
   .flex{display:flex;gap:16px} .col{flex:1;min-width:0}
   /* tabs */
   .tabs{display:flex;gap:6px;border-bottom:1px solid var(--line);margin:16px 0 0}
@@ -94,6 +117,37 @@
     background:var(--panel2);border-bottom:1px solid var(--line);
     position:sticky;top:49px;z-index:4;font-size:13px}
   #runbar .bar{flex:1;max-width:340px;min-width:120px}
+  /* copy-to-clipboard button next to a transcribable value */
+  .copybtn{background:transparent;border:1px solid var(--line);color:var(--mut);
+    border-radius:5px;padding:0 6px;font-size:12px;line-height:1.7;cursor:pointer;
+    vertical-align:middle;margin-left:4px}
+  .copybtn:hover{color:var(--ink);border-color:var(--accent)}
+  .copybtn.copied{color:var(--ok);border-color:var(--ok)}
+  /* an editable field with a copy button that grabs its live value */
+  .field-copy{display:flex;gap:4px;align-items:stretch}
+  .field-copy input{flex:1;min-width:0}
+  /* grouped rows tab: a supplier header, with its unmatched rows nested beneath.
+     Extra vertical padding sets the supplier header apart from its rows. */
+  .grouphead>td{background:var(--panel2);border-top:2px solid var(--line);
+    padding-top:13px;padding-bottom:13px}
+  /* the rows under a supplier are indented + carry a faint left rail, so they read
+     as children of the supplier header directly above them. The whole row is a link
+     to that row's "Find PDF" picker, so it takes a pointer + a hover-lit rail. */
+  tr.datarow{cursor:pointer}
+  tr.datarow>td:first-child{padding-left:30px;box-shadow:inset 3px 0 0 var(--line)}
+  tr.datarow:hover>td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
+  /* right-side PDF preview drawer + its backdrop */
+  #pdf-back{position:fixed;inset:0;z-index:59;background:rgba(8,10,14,.45)}
+  #pdf-drawer{position:fixed;top:0;right:0;bottom:0;width:min(52vw,720px);z-index:60;
+    background:var(--panel);border-left:1px solid var(--line);display:flex;flex-direction:column;
+    box-shadow:-8px 0 24px rgba(0,0,0,.4)}
+  /* an ID rule's display:flex outranks the [hidden] attribute, so it must be
+     explicitly re-hidden or the drawer is stuck open and won't close. */
+  #pdf-drawer[hidden],#pdf-back[hidden]{display:none}
+  #pdf-drawer .dh{display:flex;align-items:center;gap:10px;padding:10px 14px;
+    border-bottom:1px solid var(--line)}
+  #pdf-drawer .dh b{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-size:13px}
+  #pdf-drawer embed{flex:1;width:100%;background:#fff}
 </style>
 </head>
 <body>
@@ -184,11 +238,10 @@
 </script>
 {% endif %}
 
-<!-- Blocking progress overlay for the long post-scan jobs (export / Drive upload).
-     These take minutes on a Drive run — one network round-trip per invoice — and
-     running them inside the POST with no feedback was indistinguishable from the
-     app being broken: you clicked, nothing happened, and everything else you
-     clicked queued behind it. -->
+<!-- Blocking progress overlay for the long post-scan job (the export). It copies
+     every matched invoice and rewrites the workbook, and running it inside the POST
+     with no feedback was indistinguishable from the app being broken: you clicked,
+     nothing happened, and everything else you clicked queued behind it. -->
 <div id="busy-ov">
   <div class="box">
     <div class="flex" style="gap:12px;align-items:center">
@@ -204,11 +257,39 @@
   </div>
 </div>
 
+<!-- A heavier confirmation than a plain confirm() — for the one genuinely
+     irreversible action in the app, so it can show what's actually about to happen
+     instead of a generic "are you sure?". Driven by UI.confirmModal(). -->
+<div id="confirm-ov" style="display:none;position:fixed;inset:0;z-index:55;
+     background:rgba(8,10,14,.72);align-items:center;justify-content:center">
+  <div class="box" style="background:var(--panel);border:1px solid var(--line);
+       border-radius:12px;padding:20px 22px;width:min(480px,90vw)">
+    <b id="co-title" style="font-size:15px"></b>
+    <div id="co-body" class="muted" style="margin-top:10px;line-height:1.6"></div>
+    <div class="flex" style="gap:10px;justify-content:flex-end;margin-top:18px">
+      <button class="btn ghost sm" id="co-cancel" type="button">Cancel</button>
+      <button class="btn finish sm" id="co-ok" type="button"></button>
+    </div>
+  </div>
+</div>
+
+<!-- PDF preview drawer: confirm a candidate invoice visually without leaving the
+     review queue. Reuses /pdf/<id>, which serves just the page for a page-invoice. -->
+<div id="pdf-back" hidden></div>
+<div id="pdf-drawer" hidden>
+  <div class="dh">
+    <b id="pdf-drawer-title">Preview</b>
+    <a class="btn ghost sm" id="pdf-drawer-open" target="_blank" rel="noopener">Open full ↗</a>
+    <button class="btn ghost sm" id="pdf-drawer-close" type="button">Close ✕</button>
+  </div>
+  <embed id="pdf-drawer-embed" type="application/pdf">
+</div>
+
 <script>
 // ---- shared UI helpers ----------------------------------------------------
-// Every mutating action in this app can be slow (a Drive run makes each one a
-// network call), so nothing may look inert after a click: buttons go busy, long
-// jobs get a real progress bar.
+// Every mutating action in this app can be slow (the export copies every matched
+// invoice), so nothing may look inert after a click: buttons go busy, long jobs get
+// a real progress bar.
 window.UI = (function(){
   const $ = id => document.getElementById(id);
   const ov = $("busy-ov");
@@ -309,7 +390,152 @@ window.UI = (function(){
     if(b){ e.preventDefault(); openOutput(b); }
   });
 
-  return {busy, runTask, openOutput, armForms};
+  // A heavier confirm() — for the one truly irreversible action (Finish & export),
+  // which used to get the exact same plain browser confirm() as a reversible click
+  // like "skip this supplier". `body` may be HTML (e.g. real counts), not just text.
+  // Resolves true/false; never throws, so the caller can always `if(await ...)`.
+  const co = $("confirm-ov");
+  function confirmModal({title, body, okLabel}){
+    return new Promise(resolve => {
+      $("co-title").textContent = title || "Are you sure?";
+      $("co-body").innerHTML = body || "";
+      $("co-ok").textContent = okLabel || "Confirm";
+      co.style.display = "flex";
+      const done = ok => { co.style.display = "none"; cleanup(); resolve(ok); };
+      const onOk = () => done(true), onCancel = () => done(false);
+      const onKey = e => { if(e.key === "Escape") done(false); };
+      function cleanup(){
+        $("co-ok").removeEventListener("click", onOk);
+        $("co-cancel").removeEventListener("click", onCancel);
+        document.removeEventListener("keydown", onKey);
+      }
+      $("co-ok").addEventListener("click", onOk);
+      $("co-cancel").addEventListener("click", onCancel);
+      document.addEventListener("keydown", onKey);
+    });
+  }
+
+  return {busy, runTask, openOutput, armForms, confirmModal};
+})();
+</script>
+
+<script>
+// ---- clipboard + PDF preview + the shared candidate-row renderer -----------
+// One implementation of "here is a PDF you can bind", used by the standalone
+// picker page (link_row) — its search, browse and near-miss tabs all render rows
+// through here, so a bind behaves identically wherever it is triggered.
+window.LINK = (function(){
+  const esc = s => (s == null ? "" : String(s)).replace(/[&<>"']/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+  // Clipboard, delegated over [data-copy]. navigator.clipboard needs a secure
+  // context (localhost qualifies), but the desktop webview can still block it, so
+  // fall back to a hidden-textarea execCommand copy. This is the reliable way to
+  // copy a field value in the native window, which has no right-click "Copy".
+  function copyText(t){
+    if(navigator.clipboard && navigator.clipboard.writeText)
+      return navigator.clipboard.writeText(t).catch(() => execCopy(t));
+    return execCopy(t);
+  }
+  function execCopy(t){
+    try{
+      const ta = document.createElement("textarea");
+      ta.value = t; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.focus(); ta.select();
+      document.execCommand("copy"); document.body.removeChild(ta);
+    }catch(e){}
+    return Promise.resolve();
+  }
+  document.addEventListener("click", e => {
+    const b = e.target.closest && e.target.closest("[data-copy], [data-copy-prev]");
+    if(!b) return;
+    e.preventDefault(); e.stopPropagation();
+    // data-copy-prev copies the immediately-preceding field's LIVE value (so an
+    // edited invoice number copies what's on screen, not the parsed original).
+    let text = b.getAttribute("data-copy");
+    if(b.hasAttribute("data-copy-prev")){
+      const inp = b.previousElementSibling;
+      text = inp ? ("value" in inp ? inp.value : inp.textContent) : "";
+    }
+    copyText(text || "").then(() => {
+      b.classList.add("copied"); const o = b.textContent; b.textContent = "✓";
+      setTimeout(() => { b.classList.remove("copied"); b.textContent = o; }, 900);
+    });
+  });
+
+  // PDF preview drawer.
+  const drawer = document.getElementById("pdf-drawer");
+  const back = document.getElementById("pdf-back");
+  const emb = document.getElementById("pdf-drawer-embed");
+  function openPreview(id, label){
+    document.getElementById("pdf-drawer-title").textContent = label || "Preview";
+    document.getElementById("pdf-drawer-open").href = "/doc/" + encodeURIComponent(id);
+    emb.setAttribute("src", "/pdf/" + encodeURIComponent(id));
+    drawer.hidden = false; back.hidden = false;
+  }
+  function closePreview(){ drawer.hidden = true; back.hidden = true; emb.removeAttribute("src"); }
+  if(drawer){
+    document.getElementById("pdf-drawer-close").onclick = closePreview;
+    back.onclick = closePreview;
+    document.addEventListener("keydown", e => { if(e.key === "Escape" && !drawer.hidden) closePreview(); });
+    document.addEventListener("click", e => {
+      const b = e.target.closest && e.target.closest("[data-preview]");
+      if(b){ e.preventDefault(); openPreview(b.getAttribute("data-preview"), b.getAttribute("data-label")); }
+    });
+  }
+
+  // Amount shown next to the row's own invoice value, so a reviewer can match on
+  // it by eye. Blank (not "0.00") when the extractor never found a total.
+  const money = v => (v == null || v === "") ? "—"
+    : Number(v).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+
+  // One candidate row. A PDF the classifier didn't call an invoice is still
+  // bindable (often *why* the row went unmatched), but it must say so first.
+  function rowHtml(h, row){
+    const bind = "/link/row/" + row + "/bind";
+    const conf = h.confidence < 0.6 ? "bad" : h.confidence < 0.8 ? "warn" : "ok";
+    const warn = h.is_invoice ? "" :
+      `<span class="pill warn" title="the scan classified this as '${esc(h.doc_type)}'. Binding it marks it an invoice.">not an invoice</span>`;
+    const taken = (h.gstr_row && h.gstr_row !== row)
+      ? `<span class="pill info" title="already satisfies B2B row ${h.gstr_row}">row ${h.gstr_row}</span>` : "";
+    const score = h.score ? `<span class="pill ${h.score>=85?"ok":h.score>=70?"warn":"info"}">${Math.round(h.score)}%</span>` : "";
+    return `<tr>
+      <td class="mono">${esc(h.invoice_id || h.filename)}<div class="muted" style="font-size:11.5px">${esc(h.folder || "—")}</div></td>
+      <td class="mono muted">${esc(h.gstin || "—")}</td>
+      <td class="muted">${esc(h.date || "—")}</td>
+      <td class="mono muted right">${money(h.amount)}</td>
+      <td class="muted">${esc(h.vendor || h.company || "—")}</td>
+      <td><span class="pill ${conf}">${h.confidence.toFixed(2)}</span> ${warn} ${taken}</td>
+      <td>${score}</td>
+      <td class="right" style="white-space:nowrap">
+        <button class="btn ghost sm" type="button" data-preview="${esc(h.id)}" data-label="${esc(h.invoice_id || h.filename)}">Preview</button>
+        <form method="post" action="${bind}" style="display:inline" data-busy="Binding…"
+              data-confirm="${h.is_invoice ? "" : esc(h.filename)}">
+          <input type="hidden" name="doc_id" value="${esc(h.id)}">
+          <button class="btn sm" type="submit">Bind</button>
+        </form>
+      </td></tr>`;
+  }
+  const HEADER = `<tr><th>file / folder</th><th>GSTIN</th><th>date</th><th class="right">amount</th>
+      <th>vendor</th><th>status</th><th>match</th><th></th></tr>`;
+  function resultsTable(hits, row){
+    return hits.length
+      ? `<table>${HEADER}${hits.map(h => rowHtml(h, row)).join("")}</table>`
+      : `<div class="card"><span class="pill info">nothing here</span> No PDF matches.</div>`;
+  }
+
+  // Bind-confirm for a non-invoice pick, delegated once for every JS-built Bind
+  // form (an apostrophe in a filename would break an inline onsubmit). Runs before
+  // UI.armForms (which is deferred a tick and checks defaultPrevented).
+  document.addEventListener("submit", e => {
+    const name = e.target.dataset && e.target.dataset.confirm;
+    if(!name) return;
+    const m = e.target.action && e.target.action.match(/\/link\/row\/(\d+)\/bind/);
+    if(!confirm(`${name} was not detected as an invoice. Bind it${m ? " to B2B row " + m[1] : ""} and treat it as one?`))
+      e.preventDefault();
+  });
+
+  return {esc, rowHtml, resultsTable, HEADER, openPreview, copyText};
 })();
 </script>
 

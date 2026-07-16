@@ -23,7 +23,6 @@ import json
 import threading
 import traceback
 from dataclasses import replace
-from functools import partial
 from pathlib import Path
 from typing import Any, Optional
 
@@ -51,31 +50,17 @@ class RunController:
         self._thread: Optional[threading.Thread] = None
         self.control: Optional[RunControl] = None   # pause/stop for the live scan
         # The FileSource must outlive the scan: exporting the linked invoice folder
-        # pulls PDF bytes, and on a Drive run those are not on disk.
+        # pulls PDF bytes through it.
         self.file_source: Any = LocalFileSource()
-        # ---- Google Drive source/sink ----
-        self.source_mode: str = "local"    # local | drive
-        self.drive = None                  # DriveClient once signed in
+        self.source_mode: str = "local"    # local | continue
         self.resumed: bool = False         # this run reopened an interrupted one
-        self.upload_folder_name: Optional[str] = None
-        self.upload_report: Optional[dict] = None
         # The financial year this run is scoped to (None = every year under the root).
         self.fy: Optional[str] = None
-        # The current long post-scan job (export / Drive upload) and its progress.
+        # The current long post-scan job (the export) and its progress.
         self.task: Optional[dict] = None
         # The inputs of the last start, so "Resume" survives a page reload (it used
         # to live in a page-scoped JS variable and vanish on any navigation).
         self.last_input: Optional[dict] = None
-
-    # ---- Google Drive auth -------------------------------------------------
-    def authenticate_drive(self, open_browser: bool = True) -> dict:
-        """Run (or refresh) Google Drive OAuth. Returns {ok} or {ok:False,error}."""
-        try:
-            from ..io.drive import DriveClient
-            self.drive = DriveClient.authenticate(open_browser=open_browser)
-            return {"ok": True}
-        except Exception as exc:  # missing client_secret / declined consent / offline
-            return {"ok": False, "error": str(exc)}
 
     # ---- lifecycle ---------------------------------------------------------
     @property
@@ -85,48 +70,46 @@ class RunController:
 
     def start(self, invoice_root: str | Path, gstr_path: str | Path | None,
               source_mode: str = "local",
-              upload_folder_name: str | None = None,
               fy: str | None = None) -> dict:
         """Validate inputs and kick off scan on a background thread.
 
-        ``source_mode`` is "local" (a filesystem folder) or "drive" (a Google
-        Drive folder id/URL, using the already-authenticated client). If an
-        interrupted run for the same input exists, it is **reopened and resumed**
-        rather than restarted. Returns immediately with ``{ok, run_id, resumed}``.
+        ``source_mode`` is "local" (a filesystem folder) or "continue"
+        (``invoice_root`` is an existing run folder to append newly-added PDFs to —
+        its root/fy/gstr come from run_meta.json). If an interrupted run for the same
+        input exists, it is **reopened and resumed** rather than restarted. Returns
+        immediately with ``{ok, run_id, resumed}``.
         """
         if self.busy:
             return {"ok": False, "error": "A run is already in progress."}
 
         source_mode = source_mode or "local"
-        upload_name = (upload_folder_name or "").strip() or None
         fy = (fy or "").strip() or None      # "" (All years) means no scope
 
-        # Resolve the inputs *outside* the lock: on a Drive run this downloads the
-        # GSTR workbook, and holding the lock across a network fetch stalled every
-        # /run_state poll for its duration.
-        if source_mode == "drive":
-            if self.drive is None:
-                return {"ok": False, "error": "Connect Google Drive first."}
-            from ..io.drive import (DriveFileSource, file_id_from,
-                                    folder_id_from, walk_drive)
-            folder_id = folder_id_from(str(invoice_root))
-            if not folder_id:
-                return {"ok": False, "error": "Enter a Google Drive folder link or id."}
-            # The GSTR-2A workbook lives on Drive too. Fetch it now — it's small,
-            # and a bad link should fail here in the form rather than an hour
-            # later when the user clicks "Finish & export".
-            gstr: Optional[Path] = None
-            if gstr_path:
-                try:
-                    gstr = Path(self.drive.download_workbook_to_temp(
-                        file_id_from(str(gstr_path))))
-                except Exception as exc:
-                    return {"ok": False,
-                            "error": f"Could not read that GSTR-2A workbook from Drive: {exc}"}
-            root: Any = folder_id
-            root_key = f"drive:{folder_id}"
-            file_source: Any = DriveFileSource(self.drive)
-            walker: Any = partial(walk_drive, client=self.drive)
+        # Resolve the inputs *outside* the lock: opening a run dir touches the disk,
+        # and holding the lock across it stalled every /run_state poll for its duration.
+        continue_store: Optional[RunStore] = None
+        if source_mode == "continue":
+            # "Continue a saved run": ``invoice_root`` is a run folder. Its root/fy/gstr
+            # come from run_meta.json, and opening the store explicitly bypasses the
+            # completeness gate so a *finished* run can be extended — the pipeline skips
+            # every source_key already in the checkpoint, so only new PDFs are scanned.
+            try:
+                continue_store = RunStore.open_existing(str(invoice_root))
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
+            d = continue_store.describe()
+            if not d.get("root"):
+                return {"ok": False, "error": "That run folder has no recorded root."}
+            root = Path(d["root"])
+            if not root.is_dir():
+                return {"ok": False, "error": f"The run's tree {d['root']} no longer "
+                        "exists. Matches are keyed on absolute paths, so it must be "
+                        "where it was scanned."}
+            root_key = d["root"]
+            fy = d["fy"]
+            gstr = Path(d["gstr"]) if d["gstr"] else None
+            file_source = LocalFileSource()
+            walker = None
         else:
             gstr = Path(str(gstr_path)).expanduser() if gstr_path else None
             if gstr is not None and not gstr.exists():
@@ -144,29 +127,30 @@ class RunController:
                 return {"ok": False, "error": "A run is already in progress."}
 
             self.source_mode = source_mode
-            self.upload_folder_name = upload_name
             self.file_source = file_source
             self.fy = fy
             # A per-run copy — never mutate self.settings: the controller outlives the
             # run and the next one may pick a different year (or none).
             run_settings = replace(self.settings, fy_scope=fy)
-            # Resume an interrupted run for the same input, else mint a fresh one. The
+            # Continue mode opens an explicit run dir (finished or not). Otherwise
+            # resume an interrupted run for the same input, else mint a fresh one. The
             # input is (root, fy): an all-years run and a one-year run over the same
             # tree are different corpora and must never resume each other.
-            existing = RunStore.find_resumable(self.output_root, root_key, fy=fy)
-            self.store = existing or RunStore.new(self.output_root, label=fy)
-            self.resumed = existing is not None
+            existing = (None if continue_store
+                        else RunStore.find_resumable(self.output_root, root_key, fy=fy,
+                                                     pages=run_settings.explode_pages))
+            self.store = continue_store or existing or RunStore.new(self.output_root, label=fy)
+            self.resumed = continue_store is not None or existing is not None
             self.result = None
             self.plan = None
             self.link_report = None
-            self.upload_report = None
             self.gstr_path = gstr
             self.error = None
             self.phase = "scanning"
             self.control = RunControl()
             self.last_input = {
                 "invoice": str(invoice_root), "gstr": str(gstr_path or ""),
-                "source_mode": source_mode, "upload_folder": upload_name or "",
+                "source_mode": source_mode,
                 # Load-bearing: the Resume button POSTs last_input verbatim. Drop the
                 # year here and resuming a stopped one-year run would start a fresh
                 # *unscoped* run that rescans the whole tree from zero.
@@ -266,11 +250,11 @@ class RunController:
             self.link_report = report
         return report
 
-    # ---- long post-scan jobs (export / Drive upload) ------------------------
-    # These are *slow* — on a Drive run each matched invoice is a network download,
-    # and each uploaded one a Drive round-trip. Run synchronously inside the POST
-    # they froze the whole window for minutes with no sign of life, and every review
-    # edit blocked behind the same write lock. So they run on a thread and publish
+    # ---- long post-scan job (the export) ------------------------------------
+    # "Finish & export" is *slow* — write_linked copies every matched invoice's
+    # bytes and rewrites the workbook cell by cell. Run synchronously inside the POST
+    # it froze the whole window for seconds with no sign of life, and every review
+    # edit blocked behind the same write lock. So it runs on a thread and publishes
     # progress that the page polls, exactly like the scan does.
     def task_state(self) -> dict:
         with self._lock:
@@ -310,52 +294,6 @@ class RunController:
         threading.Thread(target=run, daemon=True).start()
         return {"ok": True, "kind": kind}
 
-    def upload_results(self, on_progress=None) -> dict:
-        """Publish outputs to a NEW Google Drive folder (drive mode only).
-
-        Creates ``<name>/`` with the master workbook plus an ``invoices/``
-        subfolder of the detected invoices — the latter assembled with
-        server-side ``files.copy`` so invoice bytes never leave Drive. The input
-        tree is only ever read, never modified.
-        """
-        if self.source_mode != "drive" or self.drive is None \
-                or self.result is None or self.store is None:
-            return {"ok": False, "error": "No Drive run to upload."}
-        try:
-            from ..io.drive import XLSX_MIME
-            name = self.upload_folder_name or f"InvoiceLinker {self.store.run_id}"
-            folder_id = self.drive.create_folder(name)
-            master = self.store.master_path()
-            if master.exists():
-                self.drive.upload_file(master, folder_id, mime=XLSX_MIME)
-            # The linked GSTR-2A workbook is the point of the whole run, so it goes
-            # up alongside the master (when linking has actually been run).
-            linked = False
-            if self.link_report is not None:
-                out = Path(self.link_report.out_path)
-                if out.exists():
-                    self.drive.upload_file(out, folder_id, mime=XLSX_MIME)
-                    linked = True
-            inv_folder = self.drive.create_folder("invoices", folder_id)
-            # One server-side copy per invoice — a network round-trip each, so report
-            # progress rather than sitting silent for minutes on a big run.
-            todo = [d for d in self.result.invoices() if d.drive_file_id]
-            copied = 0
-            if on_progress:
-                on_progress(0, len(todo))
-            for d in todo:
-                self.drive.copy_file(d.drive_file_id, inv_folder, name=d.filename)
-                copied += 1
-                if on_progress:
-                    on_progress(copied, len(todo))
-            report = {"ok": True, "folder": name, "folder_id": folder_id,
-                      "invoices": copied, "linked_workbook": linked}
-        except Exception as exc:
-            report = {"ok": False, "error": str(exc)}
-        with self._lock:
-            self.upload_report = report
-        return report
-
     # ---- views -------------------------------------------------------------
     def status(self) -> dict:
         """Fine-grained scan progress (from status.json) with live control state.
@@ -390,7 +328,6 @@ class RunController:
                 "has_gstr": self.gstr_path is not None,
                 "source_mode": self.source_mode,
                 "fy": self.fy,
-                "drive_signed_in": self.drive is not None,
                 "resumed": self.resumed,
                 "last_input": self.last_input,
                 "busy": self.phase in ("scanning", "linking", "finishing"),
@@ -399,6 +336,4 @@ class RunController:
                 st["summary"] = self.result.summary()
             if self.plan is not None:
                 st["link"] = self.plan.counts()
-            if self.upload_report is not None:
-                st["upload"] = self.upload_report
         return st

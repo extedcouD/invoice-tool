@@ -19,7 +19,7 @@ from .core.interfaces import FileSource
 from .core.models import Document, DocType, RunResult
 from .core.pipeline import Pipeline
 from .io.excel import write_master
-from .io.pdf import PdfTextSource
+from .io.pdf import PdfTextSource, write_page_pdf
 from .io.runstore import RunStore
 from .io.sources import LocalFileSource
 from .matching import vendor as vendormatch
@@ -30,10 +30,10 @@ from .stages.extract import ExtractStage
 from .stages.parse import ParseStage
 from .stages.reconcile import ReconcileStage
 from .stages.validate import ValidateStage
-from .stages.walk import walk
+from .stages.walk import walk, walk_pages
 
-# A walker streams seed Documents from a root (local path or Drive folder id),
-# checking in with the RunControl as it goes.
+# A walker streams seed Documents from a root (a local path), checking in with the
+# RunControl as it goes. Kept pluggable behind the FileSource seam.
 Walker = Callable[..., Iterable[Document]]
 
 
@@ -103,9 +103,14 @@ def _copy_one_flagged(d: Document, store: RunStore, file_source: FileSource) -> 
         record(d, "review", "fetch_failed", str(exc), severity="warn")
         return
     try:
-        shutil.copy2(local, dest)
+        # A page-invoice copies just its own page, so the review PDF shows one
+        # invoice; a whole-file doc is a straight byte copy as before.
+        if d.page_index is not None:
+            write_page_pdf(local, d.page_index, dest)
+        else:
+            shutil.copy2(local, dest)
         d.review_pdf_path = str(dest.resolve())  # absolute so the web app can serve it
-    except OSError as exc:
+    except Exception as exc:
         record(d, "review", "copy_failed", str(exc), severity="warn")
     finally:
         file_source.cleanup(d, local)
@@ -114,13 +119,11 @@ def _copy_one_flagged(d: Document, store: RunStore, file_source: FileSource) -> 
 def _copy_flagged(result: RunResult, store: RunStore, file_source: FileSource,
                   workers: int = 4) -> None:
     """Pre-copy flagged PDFs into the run's review folder so the web UI can serve
-    them. Bytes come through the FileSource, so a Drive-hosted doc is downloaded
-    here.
+    them. Bytes come through the FileSource.
 
-    Done in parallel: on a Drive run this is one network download per flagged doc,
-    and serially it was the single longest part of the shutdown path. It is also
-    only an optimization — ``/pdf/<id>`` materializes on demand for anything not
-    copied — so a stopped run skips it entirely.
+    Done in parallel, since serially it was the single longest part of the shutdown
+    path. It is also only an optimization — ``/pdf/<id>`` materializes on demand for
+    anything not copied — so a stopped run skips it entirely.
     """
     flagged = [d for d in result.documents if d.needs_review]
     if not flagged:
@@ -137,7 +140,7 @@ def run_scan(root, out_root: Path, settings: Settings = DEFAULTS,
              control: "RunControl | None" = None,
              gstr_path: Path | None = None,
              on_phase: Optional[Callable[[str], None]] = None) -> tuple[RunStore, RunResult]:
-    """Scan a tree (local path or, via ``walker``/``file_source``, a Drive folder).
+    """Scan a local tree (``walker``/``file_source`` are pluggable behind the seam).
 
     Resumable: if ``store`` already holds a checkpoint (an interrupted run reopened
     by the caller), every source already recorded is skipped and only the
@@ -157,16 +160,23 @@ def run_scan(root, out_root: Path, settings: Settings = DEFAULTS,
     the UI can stop claiming to scan while it is really writing a workbook.
     """
     file_source = file_source or LocalFileSource()
-    walker = walker or walk
+    # Explode each PDF into one invoice per page (always on) unless a caller opts
+    # out via Settings (tests) or injects its own walker.
+    walker = walker or (walk_pages if settings.explode_pages else walk)
     # A caller (e.g. the desktop RunController) may pre-create/reopen the run dir
     # so it can poll status.json from t=0; otherwise mint a fresh one here.
     store = store or RunStore.new(out_root, label=settings.fy_scope)
-    # root_key identifies the input for resume-matching; for a local path it's the
-    # resolved path, for Drive the caller passes the folder id explicitly. The FY the
-    # run was scoped to is a *second* half of that identity (see find_resumable) —
-    # an all-years run and a one-year run over the same tree are different corpora.
+    # root_key identifies the input for resume-matching — for a local path it's the
+    # resolved path. The FY the run was scoped to is a *second* half of that identity
+    # (see find_resumable) — an all-years run and a one-year run over the same tree
+    # are different corpora.
     root_key = root_key if root_key is not None else str(Path(root).resolve())
-    store.write_meta(root=root_key, complete=False, fy=settings.fy_scope)
+    # `pages` records whether this run splits PDFs per page. It is part of the run's
+    # corpus identity (like `fy`): a page-exploded run must never resume a whole-file
+    # checkpoint, or one `detections.json` would mix a stale whole-file doc with its
+    # N page docs. See RunStore.find_resumable.
+    store.write_meta(root=root_key, complete=False, fy=settings.fy_scope,
+                     pages=settings.explode_pages)
 
     def phase(name: str) -> None:
         if on_phase is not None:
@@ -219,7 +229,7 @@ def run_scan(root, out_root: Path, settings: Settings = DEFAULTS,
             store.update_meta(link_error=str(exc))
 
     # Only an optimization (see _copy_flagged), and the longest part of the
-    # shutdown path on Drive — a stopped run skips it and gets the user out.
+    # shutdown path — a stopped run skips it and gets the user out.
     if not pipeline.cancelled:
         phase("finishing")
         _copy_flagged(result, store, file_source, workers=settings.workers)
@@ -227,7 +237,8 @@ def run_scan(root, out_root: Path, settings: Settings = DEFAULTS,
     result.finished_at = datetime.now().isoformat(timespec="seconds")
     store.save(result)
     write_master(result, store.master_path())
-    store.write_meta(root=root_key, complete=complete, fy=settings.fy_scope)
+    store.write_meta(root=root_key, complete=complete, fy=settings.fy_scope,
+                     pages=settings.explode_pages)
     reporter.finish(result.summary())
     return store, result
 
@@ -244,7 +255,9 @@ def link_now(result: RunResult, gstr_path: Path, store: RunStore,
 
     gstr_path = _keep_gstr_with_run(Path(gstr_path), store)
     rows = read_b2b_rows(gstr_path)
-    plan = match(rows, result.invoices(), store.manual_links())
+    plan = match(rows, result.invoices(), store.manual_links(),
+                 skipped=store.skipped_suppliers(),
+                 not_found_rows=store.manual_not_found())
     apply_plan(result, plan)
     store.save_link(plan)
     return plan
@@ -254,10 +267,10 @@ def _keep_gstr_with_run(gstr_path: Path, store: RunStore) -> Path:
     """Copy the return into the run dir and remember it by absolute path.
 
     The run dir is the single source of truth, and the workbook has to survive with
-    it: on a Drive run the caller hands us a *temp* download that will vanish, and a
-    path typed at the CLI is relative to whatever cwd that invocation had. Either
-    way, reopening the run later (`invoices review`) could no longer find the return
-    and "Finish & export" would claim none was ever chosen.
+    it: a path typed at the CLI is relative to whatever cwd that invocation had, so
+    reopening the run later (`invoices review`) could no longer find the return and
+    "Finish & export" would claim none was ever chosen. Keeping the copy inside the run
+    dir also lets a *copied* run folder find its workbook.
     """
     kept = store.dir / gstr_path.name
     try:

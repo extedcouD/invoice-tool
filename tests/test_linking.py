@@ -10,8 +10,8 @@ from __future__ import annotations
 import pytest
 
 from invoices.core.models import Document, DocType, Fields, LinkStatus, RunResult
-from invoices.io.gstr import (AMBIGUOUS, B2BRow, MATCHED, NOT_FOUND, apply_plan,
-                              match, suggest)
+from invoices.io.gstr import (AMBIGUOUS, B2BRow, MANUAL_NOT_FOUND, MATCHED,
+                              NOT_FOUND, SKIPPED, apply_plan, match, suggest)
 
 
 def inv(doc_id: str, number: str | None, gstin: str | None,
@@ -188,3 +188,73 @@ def test_blank_rows_are_skipped_not_counted():
     # a row with no number can never resolve, but it is still reported, not dropped
     assert plan.rows[0].status == NOT_FOUND
     assert plan.rows[1].status == MATCHED
+
+
+# ---- skipping a whole supplier --------------------------------------------
+def test_skip_supplier_marks_only_its_unmatched_rows():
+    """The reviewer skips an entity — its unmatched rows leave the queue; a matched
+    row (even of that supplier) is untouched, and a match still wins over a skip."""
+    rows = [
+        B2BRow(row=2, gstin=G1, invoice_no="APEX/1", supplier="Apex Traders"),
+        B2BRow(row=3, gstin=G2, invoice_no="ZED/9", supplier="Zephyr Ltd"),
+    ]
+    docs = [inv("d1", "APEX/1", G1)]                 # only Apex is filed
+    plan = match(rows, docs, skipped=["Zephyr Ltd"])
+    by_row = {r.row: r for r in plan.rows}
+
+    assert by_row[2].status == MATCHED               # matched row untouched
+    assert by_row[3].status == SKIPPED               # unmatched row of a skipped supplier
+    assert "ZED/9" not in {r.invoice_no for r in plan.unresolved_rows()}
+    assert plan.counts()["skipped"] == 1
+
+
+def test_skip_does_not_override_a_match_for_that_supplier():
+    rows = [B2BRow(row=2, gstin=G1, invoice_no="APEX/1", supplier="Apex Traders")]
+    plan = match(rows, [inv("d1", "APEX/1", G1)], skipped=["Apex Traders"])
+    assert plan.rows[0].status == MATCHED
+
+
+def test_skip_supplier_matches_across_case_and_spacing():
+    rows = [B2BRow(row=2, gstin=G2, invoice_no="ZED/9", supplier="Zephyr   Ltd")]
+    plan = match(rows, [], skipped=["zephyr ltd"])   # different case + spacing
+    assert plan.rows[0].status == SKIPPED
+
+
+# ---- reviewer confirms a row has no PDF -----------------------------------
+def test_manual_not_found_leaves_the_queue():
+    """A row the reviewer searched for by hand and gave up on: it becomes
+    MANUAL_NOT_FOUND, drops out of the queue, and is counted on its own."""
+    rows = [row(2, "GONE/22-23/009", G2)]
+    plan = match(rows, [], not_found_rows={2})
+
+    assert plan.rows[0].status == MANUAL_NOT_FOUND
+    assert plan.rows[0].unresolved is False
+    assert plan.unresolved_rows() == []
+    assert plan.counts()["manual_not_found"] == 1
+
+
+def test_a_real_match_wins_over_a_confirmed_not_found():
+    """Marking a row not-found is only a last resort — if it actually matches (e.g.
+    a corrected field), the match wins and the stale mark is ignored."""
+    rows = [row(2, "APEX/22-23/003", G1)]
+    plan = match(rows, [inv("d1", "APEX/22-23/003", G1)], not_found_rows={2})
+    assert plan.rows[0].status == MATCHED
+
+
+def test_per_row_not_found_wins_over_a_supplier_skip():
+    """A per-row confirmation is more specific than a supplier skip, so it wins for
+    that row (both leave the queue, but they export differently)."""
+    rows = [B2BRow(row=2, gstin=G1, invoice_no="APEX/1", supplier="Apex Traders")]
+    plan = match(rows, [], skipped=["Apex Traders"], not_found_rows={2})
+    assert plan.rows[0].status == MANUAL_NOT_FOUND
+
+
+# ---- rerun: an already-filled link column ---------------------------------
+def test_existing_ref_is_carried_onto_the_rowmatch():
+    """A pre-filled 'Invoice Ref' value round-trips onto the RowMatch so the writer
+    can preserve it and the UI can show it."""
+    rows = [B2BRow(row=2, gstin=G1, invoice_no="X/1",
+                   supplier="Acme", existing_ref="prior.pdf")]
+    plan = match(rows, [])
+    assert plan.rows[0].existing_ref == "prior.pdf"
+    assert plan.rows[0].status == NOT_FOUND          # still surfaced for review

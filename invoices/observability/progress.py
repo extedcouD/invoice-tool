@@ -163,8 +163,8 @@ class StatusWriter(Reporter):
     def discovered(self, n: int, complete: bool) -> None:
         """Publish the growing file count during the walk.
 
-        Without this, a big Drive tree shows `0 / 0` and a frozen bar for minutes
-        while the walker enumerates it — the run looks hung.
+        Without this, a big tree shows `0 / 0` and a frozen bar for minutes while
+        the walker enumerates it — the run looks hung.
         """
         self._total = n
         self._discovering = not complete

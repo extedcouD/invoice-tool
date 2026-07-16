@@ -1,0 +1,132 @@
+{# Reusable bits shared across review templates. #}
+
+{# A small copy-to-clipboard button placed next to a value the reviewer transcribes
+   (invoice number, GSTIN, date, amounts). The click is handled by a single
+   delegated listener in base.html (window.UI), which works in the native desktop
+   window where there is no right-click "Copy". Renders nothing for an empty value. #}
+{% macro copyable(value) -%}
+{%- if value %}<button type="button" class="copybtn" data-copy="{{ value }}" title="Copy">⧉</button>{% endif -%}
+{%- endmacro %}
+
+{# An editable review field (name + label + value) with a copy button that grabs the
+   input's live value. `data-copy-prev` (handled in base.html) reads the sibling input. #}
+{% macro field(name, label, value) -%}
+<div><label>{{ label }}</label>
+  <div class="field-copy">
+    <input name="{{ name }}" value="{{ value }}">
+    <button type="button" class="copybtn" data-copy-prev title="Copy">⧉</button>
+  </div>
+</div>
+{%- endmacro %}
+
+{# The review queue's counts line + "all clear" banner. Shared between the full page
+   render and the skip/mark-not-found AJAX responses, which swap this fragment in
+   instead of reloading — so the two never have a chance to drift out of sync. #}
+{% macro review_summary(counts) -%}
+{% if counts %}
+<div class="muted">
+  Matched <b style="color:var(--ok)">{{ counts.matched }}</b> of {{ counts.total }} B2B rows
+  {% if counts.not_found %}· <b style="color:var(--bad)">{{ counts.not_found }}</b> with no PDF{% endif %}
+  {% if counts.ambiguous %}· <b style="color:var(--warn)">{{ counts.ambiguous }}</b> ambiguous{% endif %}
+  {% if counts.skipped %}· {{ counts.skipped }} skipped{% endif %}
+  {% if counts.manual_not_found %}· {{ counts.manual_not_found }} confirmed missing{% endif %}
+</div>
+{% if counts.matched + counts.skipped + counts.manual_not_found == counts.total %}
+<div class="banner" style="margin-top:14px">
+  ✓ Every B2B row is matched, skipped or confirmed missing. Nothing left to resolve.
+</div>
+{% endif %}
+{% endif %}
+{%- endmacro %}
+
+{# The "My bindings" tab's content (empty state or table). Shared between the full
+   page render and the mark-not-found AJAX response: marking a row not found adds an
+   entry here immediately, so this can't be left stale like review_summary above. #}
+{% macro bound_pane(bound, locked) -%}
+{% if not bound %}
+  <div class="card"><span class="pill info">nothing yet</span>
+    You haven't resolved any rows by hand yet. When you bind a PDF to a B2B row from
+    the <b>Find PDF</b> page — or mark a row <b>not found</b> — it shows up here so
+    you can double-check or undo it.</div>
+{% else %}
+  <p class="muted">Every B2B row you resolved by hand — a bound PDF, or one you
+     searched for and confirmed has no PDF. <b>Undo</b> puts the row back into the
+     unmatched queue.</p>
+  <table>
+    <tr><th>row</th><th>B2B row (from the return)</th><th>resolution</th>
+        <th>status</th><th></th></tr>
+    {% for b in bound %}
+    <tr>
+      <td class="mono muted">{{ b.row }}</td>
+      <td>
+        {% if b.rm %}
+          {{ b.rm.supplier or '— (no supplier name)' }}
+          <div class="muted mono" style="font-size:11.5px">
+            {{ b.rm.gstin or '—' }} · {{ b.rm.invoice_no or '—' }}</div>
+        {% else %}
+          <span class="muted">this row is no longer in the return</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if b.kind == 'not_found' %}
+          <span class="pill bad">not found</span>
+          <span class="muted">reviewer confirmed no PDF exists</span>
+        {% elif b.doc %}
+          <span class="pill ok" style="margin-right:6px">bound PDF</span>
+          <span class="mono">{{ b.doc.fields.invoice_id or b.doc.filename }}</span>
+          <div class="muted" style="font-size:11.5px">{{ b.doc.path_info.company or '—' }}</div>
+        {% else %}
+          <span class="muted">bound PDF is missing (id {{ b.doc_id }})</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if b.effective and b.kind == 'not_found' %}
+          <span class="pill info">confirmed missing</span>
+        {% elif b.effective %}
+          <span class="pill ok">bound</span>
+        {% else %}
+          <span class="pill warn"
+                title="this decision is not currently applied — a bound PDF may have been rejected as not-an-invoice, or a corrected field auto-matched the row">not applied</span>
+        {% endif %}
+      </td>
+      <td class="right" style="white-space:nowrap">
+        {% if b.doc %}
+        <button class="btn ghost sm" type="button" data-preview="{{ b.doc.id }}"
+                data-label="{{ b.doc.fields.invoice_id or b.doc.filename }}">Preview</button>
+        {% endif %}
+        {% if not locked %}
+          {% if b.kind == 'not_found' %}
+          <button class="btn ghost sm unmark-nf" type="button" data-row="{{ b.row }}">Undo</button>
+          {% else %}
+          <form method="post" action="{{ url_for('bind_row', row=b.row) }}"
+                style="display:inline" data-busy="Undoing…"
+                onsubmit="return confirm('Undo this binding? The row goes back into the unmatched queue.')">
+            <input type="hidden" name="tab" value="bound">
+            <button class="btn ghost sm" type="submit">Undo</button>
+          </form>
+          {% endif %}
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+{% endif %}
+{%- endmacro %}
+
+{# The "Skipped suppliers" card on the unmatched-rows tab. Same sharing rationale as
+   review_summary above. #}
+{% macro skipped_card(skipped_suppliers, locked) -%}
+{% if skipped_suppliers %}
+<div class="card" style="margin-bottom:12px">
+  <b>Skipped suppliers ({{ skipped_suppliers|length }})</b>
+  <span class="muted">— their unmatched rows export as <span class="mono">SKIPPED</span>.</span>
+  <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:8px">
+    {% for s in skipped_suppliers %}
+    <span class="pill info">{{ s }}{% if not locked %}
+      <a href="#" class="unskip" data-supplier="{{ s }}" title="un-skip"
+         style="margin-left:4px">✕</a>{% endif %}</span>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+{%- endmacro %}

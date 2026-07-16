@@ -36,10 +36,10 @@ class TextSource(ABC):
 class FileSource(ABC):
     """Strategy for making a document's PDF bytes available as a local file.
 
-    Decouples *where* a PDF lives (local disk, Google Drive, …) from the
-    extract/OCR/review code, which only ever needs a readable local path. A
-    remote source downloads to a temp file in :meth:`materialize` and removes it
-    in :meth:`cleanup`; the local source is a no-op passthrough of ``doc.path``.
+    Decouples *where* a PDF lives from the extract/OCR/review code, which only ever
+    needs a readable local path. The local source is a no-op passthrough of
+    ``doc.path``; the seam is kept so a future remote source could download to a temp
+    file in :meth:`materialize` and remove it in :meth:`cleanup`.
     """
 
     @abstractmethod

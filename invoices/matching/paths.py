@@ -30,8 +30,6 @@ from rapidfuzz import fuzz, process
 
 from ..core.models import Document
 
-DRIVE_PREFIX = "drive://"
-
 # Below this a document is noise, not a near-miss. It is a *mean* over the query's
 # tokens (a token the document doesn't have scores 0), so 62 means "most of what
 # you typed is in this path".
@@ -50,14 +48,11 @@ SHORT_TOKEN = 2
 def rel_parts(doc: Document, root: str | None = None) -> list[str]:
     """The doc's path relative to the scan root, as folder components + filename.
 
-    Handles both sources: a local run stores an absolute path, a Drive run stores
-    a ``drive://a/b/c.pdf`` display string that is *already* root-relative. Falls
-    back to the raw parts if the path doesn't sit under ``root`` (a run reopened
-    from a moved folder, say) — a degraded breadcrumb beats an exception.
+    A local run stores an absolute path. Falls back to the raw parts if the path
+    doesn't sit under ``root`` (a run reopened from a moved folder, say) — a degraded
+    breadcrumb beats an exception.
     """
     p = doc.path or doc.filename
-    if p.startswith(DRIVE_PREFIX):
-        return [x for x in p[len(DRIVE_PREFIX):].split("/") if x]
     path = Path(p)
     if root:
         for base in (Path(root), Path(root).resolve()):
@@ -118,6 +113,14 @@ class PathIndex:
             for tok in set(hay.split()):
                 self._postings.setdefault(tok, []).append(i)
         self._vocab: list[str] = list(self._postings)
+        # A stable filing order for the flat "Browse PDFs" list, computed once.
+        self._order: list[int] = sorted(
+            range(len(self.docs)), key=lambda i: "/".join(self.rel[i]).lower())
+        # Full-text haystacks, built lazily on the first content search only:
+        # unlike the ranked `search`, the flat browse greps the actual PDF text,
+        # which is far larger than the path+fields and not worth folding in until
+        # someone asks for it.
+        self._content_hay: Optional[list[str]] = None
 
     @staticmethod
     def _searchable(d: Document, rel: Sequence[str]) -> str:
@@ -202,6 +205,48 @@ class PathIndex:
         # Detected invoices first at equal score: they bind without a promotion.
         hits.sort(key=lambda h: (-h.score, not h.is_invoice, h.doc.id))
         return hits[:limit]
+
+    # ---- flat, paginated listing (content-searchable) --------------------
+    def _content_haystacks(self) -> list[str]:
+        """Lowercased ``path + filename + extracted text`` per document, once.
+
+        This is the only place a PDF's *full text* enters a haystack. The ranked
+        :meth:`search` deliberately stays on paths + parsed fields for speed, but
+        the flat browse lets a reviewer grep the body — so a term that only ever
+        appears inside the PDF (a PO number, a bill-to name) still finds it.
+        """
+        if self._content_hay is None:
+            self._content_hay = [
+                (" ".join(self.rel[i]) + " " + (self.docs[i].text or "")).lower()
+                for i in range(len(self.docs))
+            ]
+        return self._content_hay
+
+    def flat(self, q: str = "", page: int = 1, page_size: int = 50) -> dict:
+        """One page of *every* PDF in the run, filtered by a plain substring query.
+
+        Unlike :meth:`search` this is exhaustive and paginated rather than a
+        fuzzy top-N: it is the "show me all of them, and let me grep the text"
+        view. ``q`` is split on whitespace and every term must appear (as a
+        substring) in the file's path, name or extracted text — so it doubles as
+        a filename, path *and* content search from one box.
+        """
+        terms = [t for t in q.lower().split() if t]
+        if terms:
+            hay = self._content_haystacks()
+            order = [i for i in self._order if all(t in hay[i] for t in terms)]
+        else:
+            order = self._order
+        total = len(order)
+        page_size = max(1, page_size)
+        pages = (total + page_size - 1) // page_size
+        page = min(max(1, page), max(1, pages))
+        start = (page - 1) * page_size
+        return {
+            "total": total, "page": page, "pages": pages, "page_size": page_size,
+            "files": [Hit(doc=self.docs[i], score=0.0, rel=self.rel[i])
+                      for i in order[start:start + page_size]],
+        }
 
     # ---- browse ----------------------------------------------------------
     def browse(self, prefix: Sequence[str] = ()) -> dict:

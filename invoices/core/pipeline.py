@@ -9,7 +9,7 @@ Design goals:
   - **Streaming**: documents are *pulled* from the walker as capacity frees up,
     with a bounded window of in-flight work. The first PDF starts processing
     immediately instead of after the whole tree has been enumerated — which on a
-    120 GB Drive tree was minutes of dead air with pause/stop doing nothing.
+    120 GB tree was minutes of dead air with pause/stop doing nothing.
 
 Cancellation is cooperative and checked *between stages* (see `run_one`), so a
 Stop lands within one stage rather than one whole document — a scanned PDF is one

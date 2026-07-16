@@ -42,40 +42,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      # The org's OAuth client is kept out of git (Google auto-revokes clients
-      # that GitHub's secret scanner finds), so the checkout has none and the
-      # spec would quietly build a Drive-less app. Write it from the repo secret.
-      - name: Write the Google OAuth client from the repo secret
-        shell: bash
-        env:
-          CLIENT_SECRET_JSON: ${{ secrets.GOOGLE_CLIENT_SECRET_JSON }}
-        run: |
-          if [ -n "$CLIENT_SECRET_JSON" ]; then
-            printf '%s' "$CLIENT_SECRET_JSON" > packaging/client_secret.json
-            echo "wrote packaging/client_secret.json"
-          else
-            echo "::warning::GOOGLE_CLIENT_SECRET_JSON is not set — this build will have no Drive sign-in."
-          fi
-
       - name: Build app
         run: pyinstaller packaging/InvoiceGSTRLinker.spec --noconfirm
-
-      # The frozen bundle's own selftest fails when no OAuth client made it in.
-      # Shipping a release that can't sign in to Drive is the failure a user
-      # would hit first, so it is fatal on a tag and a warning otherwise.
-      - name: Verify bundle (macOS)
-        if: runner.os == 'macOS'
-        continue-on-error: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        run: dist/InvoiceGSTRLinker/InvoiceGSTRLinker --selftest
-
-      - name: Verify bundle (Windows)
-        if: runner.os == 'Windows'
-        continue-on-error: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        run: |
-          # Windowed exe: no stdout to inherit, so gate on the exit code.
-          $p = Start-Process -FilePath dist\InvoiceGSTRLinker\InvoiceGSTRLinker.exe `
-                             -ArgumentList '--selftest' -Wait -PassThru
-          if ($p.ExitCode -ne 0) { throw "selftest failed ($($p.ExitCode)) — no bundled OAuth client?" }
 
       - name: Package (macOS)
         if: runner.os == 'macOS'

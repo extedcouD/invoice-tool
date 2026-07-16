@@ -17,5 +17,3 @@ venv/
 # os
 .DS_Store
 dummy/
-# Google OAuth client injected at build time (never commit; Google auto-revokes leaked clients)
-packaging/client_secret.json

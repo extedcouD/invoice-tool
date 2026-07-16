@@ -37,6 +37,32 @@ RE_DATE = re.compile(r"^\d{1,2}-[A-Za-z]{3,9}-\d{4}$")     # 24-Sep-2022
 MIN_TEXT_CHARS = 20
 OCR_DPI = 300
 OCR_LANG = "eng"
+# Tesseract engine/segmentation flags. --oem 1 forces the LSTM engine (more
+# accurate than the legacy engine the default OEM can fall back to); --psm 6
+# assumes a single uniform block of text, which fits dense invoices better than
+# the default PSM 3 full-page layout analysis (and does *less* layout work, so
+# it is no slower). preserve_interword_spaces keeps column gaps that regexes lean on.
+OCR_CONFIG = "--oem 1 --psm 6 -c preserve_interword_spaces=1"
+
+# --- Camera-shot (photo) escalation ---------------------------------------- #
+# Phone photos of invoices need different preprocessing than flatbed scans
+# (uneven lighting, rotation), and that preprocessing is expensive. So it is an
+# *escalation*: the cheap OCR pass runs on every image page as before, and this
+# heavier pass only fires when that pass comes back below the confidence floor.
+# A clean-scan corpus therefore pays nothing for it. Set False to disable on
+# huge runs where the extra per-bad-page cost is not worth it.
+OCR_PHOTO_ENABLED = True
+# Mean per-word Tesseract confidence (0-100) below which a page is retried
+# through the photo pipeline. Also the floor below which a page is flagged
+# `low_ocr_confidence` for review. Raise to escalate more, lower to escalate less.
+OCR_PHOTO_MIN_CONFIDENCE = 55.0
+# Cap the long edge (px) fed to Tesseract on the photo pass. Phone shots are
+# often 3-4k px and Tesseract time is superlinear in pixel count; downscaling to
+# this stays legible while bounding per-page cost.
+OCR_PHOTO_MAX_DIM = 2200
+# Radius (px) of the background estimate used to flatten uneven lighting before
+# thresholding. Roughly the stroke-to-stroke spacing at OCR resolution.
+OCR_PHOTO_BG_RADIUS = 25
 
 
 # --------------------------------------------------------------------------- #
@@ -134,12 +160,16 @@ class Settings:
     # One financial year per run: the FY folder name ("FY 22-23"), or None for every
     # year under the root. It lives here, beside bank_scope (the other per-run scope
     # filter), because run_scan hands Settings to a fixed-shape
-    # `walker(root, settings, control=)` — it is the only channel that reaches BOTH
-    # walk() and walk_drive().
+    # `walker(root, settings, control=)` — the channel that reaches walk().
     fy_scope: str | None = None
     min_text_chars: int = MIN_TEXT_CHARS
     ocr_dpi: int = OCR_DPI
     ocr_lang: str = OCR_LANG
+    ocr_config: str = OCR_CONFIG
+    ocr_photo_enabled: bool = OCR_PHOTO_ENABLED
+    ocr_photo_min_confidence: float = OCR_PHOTO_MIN_CONFIDENCE
+    ocr_photo_max_dim: int = OCR_PHOTO_MAX_DIM
+    ocr_photo_bg_radius: int = OCR_PHOTO_BG_RADIUS
     invoice_score_threshold: float = INVOICE_SCORE_THRESHOLD
     fuzzy_auto_accept: float = FUZZY_AUTO_ACCEPT
     fuzzy_soft_flag: float = FUZZY_SOFT_FLAG
@@ -147,6 +177,11 @@ class Settings:
     review_confidence_threshold: float = REVIEW_CONFIDENCE_THRESHOLD
     workers: int = 1  # >1 maps documents across a thread pool (OCR shells out to tesseract)
     ocr_enabled: bool = True
+    # Treat each page of a multi-page PDF as its own invoice (a single PDF can
+    # bundle several; no invoice spans two pages). Always on in the product — this
+    # is a knob only so tests can exercise the single-Document-per-file path.
+    # Single-page PDFs are byte-identical either way.
+    explode_pages: bool = True
 
 
 DEFAULTS = Settings()

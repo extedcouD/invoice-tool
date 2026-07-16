@@ -14,7 +14,7 @@ Resumability: each document is appended to ``checkpoint.jsonl`` the moment it
 finishes, so an interrupted scan keeps its work. A resumed run skips every source
 already in the checkpoint (keyed by :attr:`Document.source_key`) and the final
 ``detections.json`` is assembled from the ledger. This matters for very large
-(e.g. 120 GB Google-Drive) trees where a run spans hours and may be interrupted.
+(e.g. 120 GB) trees where a run spans hours and may be interrupted.
 """
 from __future__ import annotations
 
@@ -198,17 +198,80 @@ class RunStore:
         self.update_meta(manual_links={str(k): v for k, v in links.items()})
         return links
 
+    # ---- suppliers the reviewer chose to skip -----------------------------
+    # Stored raw (as shown on the sheet); matching normalizes both sides. Persisted
+    # in the meta so a skip survives a reopened/continued run, exactly like the
+    # manual row bindings above.
+    def skipped_suppliers(self) -> set[str]:
+        return set(self.read_meta().get("skipped_suppliers") or [])
+
+    def set_skipped_supplier(self, name: str, on: bool = True) -> set[str]:
+        """Skip (or, with on=False, un-skip) a supplier's unmatched rows."""
+        names = self.skipped_suppliers()
+        if on and name:
+            names.add(name)
+        else:
+            names.discard(name)
+        self.update_meta(skipped_suppliers=sorted(names))
+        return names
+
+    # ---- rows the reviewer searched for by hand and confirmed have no PDF ----
+    # Same persistence shape as the manual row bindings and skipped suppliers above,
+    # so a "confirmed missing" mark survives a reopened/continued run.
+    def manual_not_found(self) -> set[int]:
+        return {int(r) for r in (self.read_meta().get("manual_not_found") or [])}
+
+    def set_manual_not_found(self, row: int, on: bool = True) -> set[int]:
+        """Mark (or, with on=False, un-mark) a B2B row as confirmed-no-PDF."""
+        rows = self.manual_not_found()
+        if on:
+            rows.add(int(row))
+        else:
+            rows.discard(int(row))
+        self.update_meta(manual_not_found=sorted(rows))
+        return rows
+
     def fy(self) -> Optional[str]:
         """The financial year this run was scoped to, or None if it scanned all years."""
         return self.read_meta().get("fy")
 
+    def describe(self) -> dict:
+        """A self-contained summary of this run folder for the "continue" UI + CLI:
+        the tree/year/GSTR it was scanned with, how many docs are already done, and
+        whether the original PDF tree is still where it was.
+
+        ``gstr`` prefers the path recorded in meta but falls back to the kept copy
+        inside the run dir (``detect._keep_gstr_with_run``), so a *copied* run folder
+        still finds its workbook. ``tree_exists`` is False when the PDF tree has moved:
+        the skip-list keys on absolute ``source_key`` paths, so a moved tree would
+        silently reprocess everything — the caller warns instead of pretending it
+        appended.
+        """
+        meta = self.read_meta()
+        root = meta.get("root")
+        gstr = meta.get("gstr_path")
+        if gstr and not Path(gstr).exists():
+            local = self.dir / Path(gstr).name
+            gstr = str(local) if local.exists() else None
+        return {
+            "dir": str(self.dir),
+            "run_id": self.run_id,
+            "root": root,
+            "fy": meta.get("fy"),
+            "gstr": gstr,
+            "complete": bool(meta.get("complete")),
+            "done": len(self.done_keys()),
+            "tree_exists": bool(root) and Path(root).exists(),
+        }
+
     @classmethod
     def find_resumable(cls, out_root: Path, root: str,
-                       fy: str | None = None) -> Optional["RunStore"]:
+                       fy: str | None = None,
+                       pages: bool | None = None) -> Optional["RunStore"]:
         """Newest incomplete run under ``out_root`` for the same input (has a
         checkpoint, meta.complete is False), or None.
 
-        The input is **(root, fy)**, not root alone. A year-scoped run and an
+        The input is **(root, fy, pages)**, not root alone. A year-scoped run and an
         all-years run over the same tree share a ``root``, so matching on root alone
         would let a fresh "FY 23-24" run reopen an interrupted "FY 22-23" checkpoint
         — and ``checkpoint_docs()`` would then assemble one detections.json spanning
@@ -218,8 +281,15 @@ class RunStore:
         ``root`` is also what every path is made relative to (``io/excel._rel``,
         ``PathIndex``) and so has to stay a real path.
 
-        Runs written before this key existed have no "fy", so they read as None and
-        still resume an unscoped run.
+        ``pages`` (per-page explosion) is the same kind of corpus identity: a
+        page-exploding run must never reopen a whole-file checkpoint, or the ledger
+        would mix a stale whole-file doc with its N page docs. When ``pages`` is None
+        the caller opts out of that filter (back-compat); when a bool, a run matches
+        only if its recorded ``pages`` marker agrees (a pre-feature run with no marker
+        reads as False, so it is refused by a page-exploding run).
+
+        Runs written before the ``fy`` key existed have no "fy", so they read as None
+        and still resume an unscoped run.
         """
         runs = sorted(Path(out_root).glob("run_*"))
         for run_dir in reversed(runs):
@@ -229,6 +299,48 @@ class RunStore:
                 continue
             if meta.get("root") == root and meta.get("fy") == fy \
                     and not meta.get("complete") \
+                    and (pages is None or bool(meta.get("pages")) == pages) \
                     and (run_dir / "checkpoint.jsonl").exists():
                 return cls(run_dir)
         return None
+
+    @classmethod
+    def list_recent(cls, out_root: Path, limit: int = 10) -> list[dict]:
+        """The most recently-touched run folders under ``out_root``, newest first —
+        backs the "Continue a saved run" picker so a reviewer can pick a run without
+        already knowing/typing its path. Each entry is a ``describe()`` dict; a run
+        folder that fails to open (mid-write, corrupt meta) is skipped rather than
+        breaking the whole list.
+        """
+        out_root = Path(out_root)
+        if not out_root.is_dir():
+            return []
+        candidates = [d for d in out_root.glob("run_*") if d.is_dir()]
+        candidates.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+        runs = []
+        for d in candidates[:limit]:
+            try:
+                info = cls.open_existing(d).describe()
+            except ValueError:
+                continue
+            info["modified"] = d.stat().st_mtime
+            runs.append(info)
+        return runs
+
+    @classmethod
+    def open_existing(cls, run_dir: Path | str) -> "RunStore":
+        """Open a specific, already-written run directory — the "continue a saved
+        run" entry point (the user points at a run folder to append newly-added PDFs).
+
+        Unlike ``find_resumable`` this ignores ``complete``: continuing a *finished*
+        run is the whole point, and passing the store explicitly to ``run_scan``
+        bypasses the completeness gate. Validate up front so a wrong folder fails here
+        with a clear message instead of as a mysterious empty scan.
+        """
+        d = Path(run_dir).expanduser()
+        if not d.is_dir():
+            raise ValueError(f"not a folder: {d}")
+        if not (d / "run_meta.json").exists() or not (d / "checkpoint.jsonl").exists():
+            raise ValueError(
+                f"{d} is not a run folder (needs run_meta.json + checkpoint.jsonl)")
+        return cls(d)

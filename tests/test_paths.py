@@ -48,13 +48,9 @@ def index() -> PathIndex:
 
 
 # ---- relative paths ------------------------------------------------------
-def test_rel_parts_local_and_drive():
+def test_rel_parts_relative_to_root():
     assert rel_parts(TREE[3], ROOT) == [
         "Zephyr Logistics", "2022-23", "Aug-2022", "15-08-2022", "ZEP-8891.pdf"]
-
-    # A Drive run stores a display string that is already root-relative.
-    d = Document(id="x", path="drive://Apex/Aug-2022/A-1.pdf", filename="A-1.pdf")
-    assert rel_parts(d, ROOT) == ["Apex", "Aug-2022", "A-1.pdf"]
 
 
 def test_rel_parts_survives_a_path_outside_the_root():
@@ -122,6 +118,40 @@ def test_browse_descends_to_the_files():
 def test_browse_an_unknown_folder_is_empty_not_an_error():
     b = index().browse(["Nope"])
     assert b["folders"] == [] and b["files"] == []
+
+
+# ---- flat, paginated, content-searchable listing -------------------------
+def test_flat_lists_every_pdf_once_across_pages():
+    idx = index()
+    seen: list[str] = []
+    for pg in (1, 2, 3):
+        r = idx.flat(page=pg, page_size=2)
+        assert r["total"] == len(TREE) and r["pages"] == 3
+        seen += [h.doc.id for h in r["files"]]
+    assert sorted(seen) == sorted(d.id for d in TREE)   # every doc, exactly once
+    assert len(set(seen)) == len(TREE)
+
+
+def test_flat_query_matches_path_or_filename():
+    idx = index()
+    assert [h.doc.id for h in idx.flat("zephyr")["files"]] == ["d4"]
+    assert [h.doc.id for h in idx.flat("approval-note")["files"]] == ["d5"]
+
+
+def test_flat_searches_inside_pdf_content():
+    """The flat browse greps the extracted body, not just path + fields — a term
+    that appears *only* inside the PDF still finds the file."""
+    body = doc("body", "Misc/scan-99.pdf")
+    body.text = "Purchase Order 4471 for widgets"
+    idx = PathIndex(TREE + [body], ROOT)
+    assert [h.doc.id for h in idx.flat("4471")["files"]] == ["body"]
+    # multi-word queries AND together over name + path + content
+    assert [h.doc.id for h in idx.flat("widgets misc")["files"]] == ["body"]
+
+
+def test_flat_clamps_an_out_of_range_page():
+    r = index().flat(page=999, page_size=2)
+    assert r["page"] == r["pages"] == 3
 
 
 # ---- folder auto-suggestion ---------------------------------------------

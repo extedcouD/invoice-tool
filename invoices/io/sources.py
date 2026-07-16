@@ -1,9 +1,9 @@
 """Concrete :class:`FileSource` strategies.
 
-`LocalFileSource` is the default and preserves the tool's original behavior
-(the PDF already lives on the local filesystem at ``doc.path``). Remote sources
-(e.g. `DriveFileSource` in :mod:`invoices.io.drive`) download to a temp file so
-the extract/OCR/review code can treat every document as a local file.
+`LocalFileSource` is the only source: the PDF already lives on the local filesystem
+at ``doc.path``. The :class:`FileSource` seam is kept so a future remote source could
+download to a temp file and let the extract/OCR/review code treat every document as a
+local file.
 """
 from __future__ import annotations
 

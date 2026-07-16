@@ -1,9 +1,9 @@
-"""The long post-scan jobs (export / Drive upload) must never block the request.
+"""The long post-scan job (the export) must never block the request.
 
-On a Drive run each matched invoice is a network download and each uploaded one a
-Drive round-trip, so run inline these took *minutes* with the window frozen and no
-progress — you clicked Finish, nothing happened, and every review edit queued behind
-the same write lock. They now run on a thread and publish progress.
+Copying every matched invoice and rewriting the workbook run inline took *seconds*
+with the window frozen and no progress — you clicked Finish, nothing happened, and
+every review edit queued behind the same write lock. It now runs on a thread and
+publishes progress.
 """
 from __future__ import annotations
 
@@ -15,7 +15,8 @@ from openpyxl import Workbook
 
 from invoices.core.interfaces import FileSource
 from invoices.core.models import Document, DocType, Fields, RunResult
-from invoices.io.gstr import DEFAULT_SHEET, B2BRow, match, write_linked
+from invoices.io.gstr import (DEFAULT_SHEET, B2BRow, match, read_b2b_rows,
+                              write_linked)
 from invoices.io.runstore import RunStore
 from invoices.web.app import create_app
 from invoices.web.runner import RunController
@@ -30,7 +31,8 @@ def _inv(doc_id: str, number: str, gstin: str) -> Document:
 
 
 class SlowSource(FileSource):
-    """Stands in for Drive: every materialize() is a slow network round-trip."""
+    """A slow FileSource: every materialize() sleeps, to prove the copies run
+    in parallel through the seam rather than one at a time."""
 
     def __init__(self, pdf, delay=0.15):
         self.pdf, self.delay = pdf, delay
@@ -98,10 +100,8 @@ def test_write_linked_reports_progress_and_fetches_in_parallel(linked_env):
 
 
 def test_the_export_keeps_the_workbooks_real_name(linked_env):
-    """`<stem>_linked.xlsx` is named after the return, so the return's name matters.
-
-    On a Drive run the workbook arrives as a temp download; naming that temp file
-    `tmpXXXX.xlsx` produced `tmpnpkuwvev_linked.xlsx` as the user's deliverable.
+    """`<stem>_linked.xlsx` is named after the return, so the return's name matters —
+    a temp-named workbook would ship `tmpnpkuwvev_linked.xlsx` as the deliverable.
     """
     store, result, plan, gstr, pdf = linked_env
     rep = write_linked(result, plan, gstr, store, file_source=SlowSource(pdf, delay=0))
@@ -134,6 +134,70 @@ def test_finish_returns_immediately_and_reports_progress(linked_env):
     assert t["done"] == t["total"] == 8
     assert ctl.link_report.matched == 8
     assert c.get("/finish").status_code == 200          # the report page
+
+
+def test_read_b2b_rows_captures_invoice_date(tmp_path):
+    """The return's Invoice Date rides onto the RowMatch so the review UI can show
+    it. A real datetime cell is normalized to a plain YYYY-MM-DD (not a stray
+    '00:00:00'); a free-text date is passed through verbatim."""
+    import datetime as dt
+
+    gstr = tmp_path / "R.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = DEFAULT_SHEET
+    ws.append(["GSTIN of Supplier", "Invoice Number", "Invoice Date", "Invoice Value"])
+    ws.append(["27ABCDE0000F1Z5", "INV-1", dt.datetime(2022, 8, 15), 100])
+    ws.append(["27ZZZZZ0000F1Z9", "Z-9", "15/09/2022", 200])   # a free-text date
+    wb.save(gstr)
+
+    rows = read_b2b_rows(gstr)
+    assert rows[0].invoice_date == "2022-08-15"       # datetime -> ISO date
+    assert rows[1].invoice_date == "15/09/2022"       # free text left as-is
+
+    # and it survives the pure match onto the RowMatch the queue renders
+    plan = match(rows, [])
+    assert plan.rows[0].invoice_date == "2022-08-15"
+
+
+def test_write_linked_writes_skipped_and_preserves_a_prefilled_ref(tmp_path):
+    """A skipped supplier's row exports SKIPPED; a pre-filled 'Invoice Ref' a human
+    put on the sheet is preserved verbatim rather than clobbered with NOT FOUND."""
+    from openpyxl import load_workbook
+
+    gstr = tmp_path / "R.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = DEFAULT_SHEET
+    ws.append(["GSTIN of Supplier", "Invoice Number",
+               "Supplier Trade/Legal Name", "Invoice Ref"])
+    ws.append(["27ABCDE0000F1Z5", "INV-1", "Apex", None])        # matched
+    ws.append(["27ZZZZZ0000F1Z9", "Z-9", "Zephyr Ltd", None])   # skipped
+    ws.append(["27CCCCC0000F1Z7", "C-5", "Carol", "prior.pdf"])  # unmatched + prefilled
+    wb.save(gstr)
+
+    pdf = tmp_path / "s.pdf"
+    pdf.write_bytes(b"%PDF-1.4 minimal")
+    store = RunStore.new(tmp_path / "out", run_id="tskip")
+    doc = _inv("d1", "INV-1", "27ABCDE0000F1Z5")
+    result = RunResult(run_id="tskip", root=str(tmp_path), documents=[doc])
+
+    rows = read_b2b_rows(gstr)                       # captures the pre-filled ref
+    plan = match(rows, result.invoices(), skipped=["Zephyr Ltd"])
+    rep = write_linked(result, plan, gstr, store, file_source=SlowSource(pdf, delay=0))
+
+    wb2 = load_workbook(rep.out_path)
+    ws2 = wb2[DEFAULT_SHEET]
+    refcol = next(c.column for c in ws2[1]
+                  if str(c.value).strip().lower() == "invoice ref")
+    vals = {ws2.cell(row=r, column=2).value: ws2.cell(row=r, column=refcol).value
+            for r in range(2, ws2.max_row + 1)}
+    wb2.close()
+
+    assert vals["Z-9"] == "SKIPPED"
+    assert vals["C-5"] == "prior.pdf"                # preserved, not clobbered
+    assert vals["INV-1"].endswith(".pdf") and vals["INV-1"] != "NOT FOUND"
+    assert rep.skipped == 1
 
 
 def test_a_second_job_is_refused_while_one_runs(linked_env):

@@ -5,15 +5,14 @@
 <!-- 1 · SETUP ------------------------------------------------------------- -->
 <div id="setup" style="display:none">
   <h1>Scan invoices &amp; link to GSTR-2A</h1>
-  <p class="muted">Scan a <span class="mono">FY&nbsp;..</span> invoice tree — from a local folder or
-     straight from <b>Google Drive</b> — and link a GSTR-2A workbook to find which
-     B2B rows have no invoice PDF.</p>
+  <p class="muted">Scan a <span class="mono">FY&nbsp;..</span> invoice tree from a local folder and
+     link a GSTR-2A workbook to find which B2B rows have no invoice PDF.</p>
   <div id="err" class="banner bad" style="display:none"></div>
   <div class="card" style="max-width:860px">
     <label>Source</label>
     <div class="flex" style="gap:8px;align-items:center;margin-bottom:14px">
       <button class="btn ghost sel" id="src-local" type="button">💻 Local folder</button>
-      <button class="btn ghost" id="src-drive" type="button">☁️ Google Drive</button>
+      <button class="btn ghost" id="src-continue" type="button">📂 Continue a saved run</button>
     </div>
 
     <!-- Local source ---------------------------------------------------- -->
@@ -34,27 +33,23 @@
       </div>
     </div>
 
-    <!-- Drive source ---------------------------------------------------- -->
-    <div id="drive-fields" style="display:none">
-      <div id="drive-connect">
-        <button class="btn" id="drive-auth" type="button">🔗 Connect Google Drive</button>
-        <span class="muted" style="margin-left:10px">Opens your browser to sign in. Results are written to a
-          <b>new</b> Drive folder — your originals are never touched.</span>
+    <!-- Continue a saved run ------------------------------------------------ -->
+    <div id="continue-fields" style="display:none">
+      <label>1 · Recent runs</label>
+      <div id="recent-runs" class="grid" style="gap:8px;margin-bottom:14px">
+        <div class="muted">Looking for saved runs…</div>
       </div>
-      <div id="drive-connected" style="display:none">
-        <div class="banner" style="margin-bottom:12px">✓ Connected to Google Drive.</div>
-        <label>1 · Invoice folder on Drive <span class="muted">(paste the folder link or id)</span></label>
-        <input id="drive-folder" placeholder="https://drive.google.com/drive/folders/…  or  <folderId>" autocomplete="off">
-        <div style="height:14px"></div>
-        <label>2 · Financial year <span class="muted">(one GSTR-2A workbook covers one year — scan just that year)</span></label>
-        <select id="drive-fy"><option value="">All years</option></select>
-        <div style="height:14px"></div>
-        <label>3 · GSTR-2A workbook on Drive <span class="muted">(optional — paste the file link; an .xlsx or a Google Sheet both work)</span></label>
-        <input id="drive-gstr" placeholder="https://drive.google.com/file/d/…/view  or  <fileId>" autocomplete="off">
-        <div style="height:14px"></div>
-        <label>4 · Output folder name <span class="muted">(a new folder created in your Drive)</span></label>
-        <input id="drive-out" placeholder="InvoiceLinker results" autocomplete="off">
+
+      <label>Or a specific saved run folder <span class="muted">(an <span class="mono">out/run_…</span> folder from a previous scan)</span></label>
+      <div class="flex" style="gap:10px;align-items:center">
+        <div class="col"><input id="cont" placeholder="/path/to/out/run_20240115-… (may be a copy you saved)" autocomplete="off"></div>
+        <button class="btn ghost" id="cont-browse" type="button">Browse…</button>
       </div>
+      <p class="muted" style="margin:10px 0 0">
+        Newly-added PDFs are appended to this run — its folder, year and GSTR-2A are reused, and only
+        files not already processed are scanned. The master &amp; linked workbook are updated in place.</p>
+      <div id="cont-detected" class="banner" style="display:none;margin-top:12px"></div>
+      <div id="cont-warn" class="banner bad" style="display:none;margin-top:12px"></div>
     </div>
 
     <div style="height:18px"></div>
@@ -103,11 +98,9 @@
   <div id="done-sub" class="muted" style="margin-bottom:16px"></div>
   <div id="done-cards" class="grid cards" style="margin-bottom:14px"></div>
   <div id="link-line" class="banner" style="display:none"></div>
-  <div id="upload-line" class="muted" style="margin-bottom:14px"></div>
   <div class="flex" style="gap:12px;flex-wrap:wrap">
     <a class="btn big" id="go-review" href="/review">Open review →</a>
     <a class="btn big ghost" href="/dashboard">Open dashboard</a>
-    <button class="btn big" id="drive-upload" type="button" style="display:none">☁️ Upload results to Drive</button>
     <button class="btn big ghost" id="open-out" type="button" style="display:none">Open output folder</button>
     <button class="btn big ghost" id="again" type="button">Run another</button>
   </div>
@@ -134,52 +127,73 @@ function fmtEta(sec){
   return "about " + h + "h " + (r ? r + "m " : "") + "left";
 }
 
-// ---- source mode (local vs Google Drive) ---------------------------------
+// ---- source mode (local folder vs continue a saved run) ------------------
 let sourceMode = "local";
-let driveConnected = false;
 function setMode(m){
   sourceMode = m;
   $("src-local").classList.toggle("sel", m==="local");
-  $("src-drive").classList.toggle("sel", m==="drive");
+  $("src-continue").classList.toggle("sel", m==="continue");
   $("local-fields").style.display = (m==="local") ? "block" : "none";
-  $("drive-fields").style.display = (m==="drive") ? "block" : "none";
-}
-function setDriveConnected(on){
-  driveConnected = on;
-  $("drive-connect").style.display = on ? "none" : "block";
-  $("drive-connected").style.display = on ? "block" : "none";
+  $("continue-fields").style.display = (m==="continue") ? "block" : "none";
+  $("run").textContent = (m==="continue") ? "▶ Scan for new files & update this run" : "▶ Run";
 }
 $("src-local").onclick = () => { setMode("local"); loadYears(); };
-$("src-drive").onclick = () => { setMode("drive"); loadYears(); };
+$("src-continue").onclick = () => { setMode("continue"); loadRecentRuns(); };
 
-$("drive-auth").onclick = async () => {
-  $("err").style.display = "none";
-  $("drive-auth").disabled = true; $("drive-auth").textContent = "Connecting…";
+// ---- recent runs (the "pick up whenever you want" entry point) ------------
+// "Continue a saved run" already handles the hard part well (inspects the folder,
+// warns if the tree moved) — but it needed you to already know the exact path.
+// This lists the last few run folders so picking one up is a click, not a paste.
+let recentLoaded = false;
+async function loadRecentRuns(){
+  if(recentLoaded) return;
+  recentLoaded = true;
+  const el = $("recent-runs");
   try{
-    const r = await fetch("/api/drive/auth", {method:"POST"});
-    const j = await r.json();
-    if(!j.ok){ showErr(j.error || "Could not connect to Google Drive."); }
-    else { setDriveConnected(true); loadYears(); }   // years need an authed client
-  }catch(e){ showErr(String(e)); }
-  $("drive-auth").disabled = false; $("drive-auth").textContent = "🔗 Connect Google Drive";
-};
+    const j = await fetch("/api/runs").then(r => r.json());
+    const runs = (j && j.runs) || [];
+    if(!runs.length){
+      el.innerHTML = '<div class="muted">No saved runs found yet.</div>';
+      return;
+    }
+    el.innerHTML = runs.map(r => {
+      const name = (r.root || "").split(/[\\/]/).filter(Boolean).pop() || r.run_id;
+      const status = r.complete
+        ? '<span class="pill ok">complete</span>'
+        : '<span class="pill warn">interrupted</span>';
+      const moved = r.tree_exists ? "" : ' <span class="pill bad">tree moved</span>';
+      return `<div class="card recent-run" style="cursor:pointer" data-dir="${esc(r.dir)}">
+        <div class="flex" style="justify-content:space-between;align-items:center;gap:10px">
+          <div style="min-width:0">
+            <b>${esc(name)}</b> <span class="muted">${esc(r.fy || "All years")}</span>
+            <div class="muted mono" style="font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.dir)}</div>
+          </div>
+          <div style="text-align:right;white-space:nowrap">${status}${moved}<br>
+            <span class="muted">${r.done||0} file(s) done</span></div>
+        </div>
+      </div>`;
+    }).join("");
+    el.querySelectorAll(".recent-run").forEach(card => card.onclick = () => {
+      $("cont").value = card.dataset.dir;
+      inspectRun();
+    });
+  }catch(e){
+    el.innerHTML = '<div class="muted">Could not load recent runs.</div>';
+  }
+}
 
 // ---- financial year -------------------------------------------------------
 // One GSTR-2A workbook covers one year, so a run is scoped to one FY folder and
 // the other years are never walked. "" = All years (the default — nothing breaks
-// if you don't pick one). Only the server can see the tree, local OR Drive, so the
-// options come from /api/years rather than being guessed here.
-const fySel   = () => sourceMode === "drive" ? $("drive-fy")     : $("fy");
-const rootBox = () => sourceMode === "drive" ? $("drive-folder") : $("inv");
-
+// if you don't pick one). Only the server can see the tree, so the options come
+// from /api/years rather than being guessed here.
 async function loadYears(keep){
-  const sel = fySel(), root = rootBox().value.trim();
+  const sel = $("fy"), root = $("inv").value.trim();
   const want = (keep != null) ? keep : sel.value;
   sel.innerHTML = '<option value="">All years</option>';
   if(!root) return;
   try{
-    const r = await fetch("/api/years?source_mode=" + encodeURIComponent(sourceMode)
-                          + "&root=" + encodeURIComponent(root));
+    const r = await fetch("/api/years?root=" + encodeURIComponent(root));
     const j = await r.json();
     for(const y of (j.years || [])){
       const o = document.createElement("option");
@@ -191,7 +205,6 @@ async function loadYears(keep){
 let yearsTimer;
 const scheduleYears = () => { clearTimeout(yearsTimer); yearsTimer = setTimeout(() => loadYears(), 400); };
 $("inv").addEventListener("input", scheduleYears);
-$("drive-folder").addEventListener("input", scheduleYears);
 
 // ---- native file dialogs (pywebview) or typed paths (browser fallback) ----
 $("inv-browse").onclick = async () => {
@@ -203,14 +216,55 @@ $("gstr-browse").onclick = async () => {
   else $("gstr").focus();
 };
 
+// ---- continue a saved run -------------------------------------------------
+// Point at an existing run folder; the server reads its run_meta.json and reports
+// the tree/year/GSTR + how many docs are already done. `tree_exists` is the guard
+// that matters: matches key on absolute paths, so a moved tree can't be appended.
+let contState = null;
+async function inspectRun(){
+  const dir = $("cont").value.trim();
+  $("cont-detected").style.display = "none";
+  $("cont-warn").style.display = "none";
+  contState = null;
+  if(!dir) return;
+  try{
+    const r = await fetch("/api/run/inspect?dir=" + encodeURIComponent(dir));
+    const j = await r.json();
+    if(!j.ok){ $("cont-warn").textContent = j.error || "Not a run folder."; $("cont-warn").style.display = "block"; return; }
+    contState = j;
+    const done = j.done + " file" + (j.done===1?"":"s") + " already processed"
+               + (j.complete ? " (complete)" : " (was interrupted)");
+    $("cont-detected").innerHTML =
+        "✔ <b>" + esc(j.run_id) + "</b> — " + esc(done) + "<br>"
+      + "root: <span class='mono'>" + esc(j.root) + "</span><br>"
+      + "year: " + esc(j.fy || "All years")
+      + " · GSTR-2A: " + esc(j.gstr ? j.gstr.split(/[\\/]/).pop() : "none");
+    $("cont-detected").style.display = "block";
+    if(!j.tree_exists){
+      $("cont-warn").innerHTML = "⚠ The recorded tree no longer exists at that path. "
+        + "Matches key on absolute paths, so continuing would reprocess everything instead "
+        + "of appending — restore the tree to its original location first.";
+      $("cont-warn").style.display = "block";
+    }
+  }catch(e){ $("cont-warn").textContent = String(e); $("cont-warn").style.display = "block"; }
+}
+let contTimer;
+$("cont").addEventListener("input", () => { clearTimeout(contTimer); contTimer = setTimeout(inspectRun, 400); });
+$("cont-browse").onclick = async () => {
+  if(hasNative()){ const p = await window.pywebview.api.pick_folder(); if(p){ $("cont").value = p; inspectRun(); } }
+  else $("cont").focus();
+};
+
 // ---- run -----------------------------------------------------------------
 function currentPayload(){
-  if(sourceMode === "drive"){
-    if(!driveConnected){ showErr("Connect Google Drive first."); return null; }
-    const folder = $("drive-folder").value.trim();
-    if(!folder){ showErr("Paste the Google Drive folder link or id."); return null; }
-    return {source_mode:"drive", invoice: folder, gstr: $("drive-gstr").value.trim(),
-            upload_folder: $("drive-out").value.trim(), fy: $("drive-fy").value};
+  if(sourceMode === "continue"){
+    const dir = $("cont").value.trim();
+    if(!dir){ showErr("Pick the saved run folder to continue."); return null; }
+    if(contState && !contState.tree_exists){
+      showErr("That run's tree has moved — continuing would reprocess everything. Restore it first.");
+      return null;
+    }
+    return {source_mode:"continue", invoice: dir};
   }
   const invoice = $("inv").value.trim();
   if(!invoice){ showErr("Choose the invoice folder first."); return null; }
@@ -391,41 +445,22 @@ function finishDone(rs){
   $("open-out").style.display = "inline-block";
   $("open-out").onclick = () => UI.openOutput($("open-out"));
 
-  // Drive: offer to publish results to a new Drive folder. This is one Drive
-  // round-trip per invoice, so it runs as a background task with a progress bar
-  // instead of a POST that sits silent for minutes.
-  if(rs.source_mode === "drive"){
-    const btn = $("drive-upload");
-    if(rs.upload && rs.upload.ok){
-      $("upload-line").textContent = `☁️ Uploaded to Drive folder “${rs.upload.folder}” `
-        + `(${rs.upload.invoices} invoice${rs.upload.invoices===1?"":"s"} + master workbook).`;
-      btn.style.display = "none";
-    } else {
-      btn.style.display = "inline-block";
-      btn.disabled = false; btn.textContent = "☁️ Upload results to Drive";
-      btn.onclick = () => UI.runTask("/api/drive/upload", {
-        title: "Uploading to Google Drive…",
-        done: () => location.reload(),      // run_state now carries the upload report
-      });
-    }
-  }
   show("done");
 }
 
 // ---- bootstrap from server-rendered state --------------------------------
 // Every bit of form state is rehydrated from run_state, so coming back from the
-// review queue no longer resets the source to Local, forgets that Drive is
-// connected, or strands a stopped run with no way to resume it.
+// review queue no longer resets the source to Local or strands a stopped run with
+// no way to resume it.
 (function(){
   if(!hasNative()) $("type-hint").style.display = "inline";
   setMode(INIT.source_mode || "local");
-  setDriveConnected(!!INIT.drive_signed_in);
+  if((INIT.source_mode || "local") === "continue") loadRecentRuns();
   const li = INIT.last_input;
   if(li){
-    if(li.source_mode === "drive"){
-      $("drive-folder").value = li.invoice || "";
-      $("drive-gstr").value = li.gstr || "";
-      $("drive-out").value = li.upload_folder || "";
+    if(li.source_mode === "continue"){
+      $("cont").value = li.invoice || "";
+      inspectRun();
     } else {
       $("inv").value = li.invoice || "";
       $("gstr").value = li.gstr || "";

@@ -73,6 +73,49 @@ def create_app(controller: RunController) -> Flask:
     def plan():
         return controller.plan
 
+    def _macro(name):
+        """A macro from _macros.html, callable from Python — lets the skip/mark-not-found
+        AJAX endpoints render the exact same counts-summary and skipped-suppliers markup
+        as the full page, so an in-place DOM swap can never drift from a full reload."""
+        return getattr(app.jinja_env.get_template("_macros.html").make_module(), name)
+
+    def _bound_list(r, p):
+        """Every B2B row a human resolved by hand — a PDF bound to it, or a
+        "searched and confirmed no PDF exists" mark — so a decision can be reviewed
+        and undone instead of vanishing from the queue the moment it lands. Sourced
+        from the stored human assertions (manual links + confirmed-missing marks),
+        not the plan's matched rows — so a decision that is no longer *applied* (its
+        PDF was later rejected, or a corrected field auto-matched the row) stays
+        visible with a warning rather than silently disappearing.
+
+        Shared by the full page render and the mark-not-found AJAX response, so a
+        fresh mark shows up in "My bindings" immediately instead of waiting for the
+        next full page load.
+        """
+        from ..io.gstr import MANUAL_NOT_FOUND
+
+        if not r or not controller.store:
+            return []
+        docs_by_id = {d.id: d for d in r.documents}
+        row_by_num = {rm.row: rm for rm in p.rows} if p else {}
+        manual = controller.store.manual_links()
+        nf_marked = controller.store.manual_not_found()
+        bound = [{
+            "row": row_num, "kind": "bound", "doc_id": doc_id,
+            "doc": docs_by_id.get(doc_id), "rm": row_by_num.get(row_num),
+            "effective": bool(row_by_num.get(row_num)
+                              and row_by_num[row_num].manual
+                              and row_by_num[row_num].doc_id == doc_id),
+        } for row_num, doc_id in manual.items()]
+        bound += [{
+            "row": row_num, "kind": "not_found", "doc_id": None,
+            "doc": None, "rm": row_by_num.get(row_num),
+            "effective": bool(row_by_num.get(row_num)
+                              and row_by_num[row_num].status == MANUAL_NOT_FOUND),
+        } for row_num in nf_marked]
+        bound.sort(key=lambda b: b["row"])
+        return bound
+
     # `gen` is bumped by every edit; the key also carries the document count so a
     # still-growing checkpoint reindexes on its own.
     index_cache: dict = {"key": None, "index": None, "gen": 0}
@@ -108,24 +151,27 @@ def create_app(controller: RunController) -> Flask:
 
     @app.route("/review")
     def review():
-        """The linking cockpit: unmatched B2B rows | unlinked invoices | flagged."""
+        """The linking cockpit: the B2B rows that still have no PDF.
+
+        This is the whole product — which rows the sheet asks for that the scan
+        could not find. (The old low-confidence review tab was removed; it never
+        helped link a row, which is the only thing this queue is for.)
+        """
         r = result()
         if not r:
             return redirect(url_for("home"))
         p = plan()
         invoices = r.invoices()
-        by_id = {d.id: d for d in r.documents}
-
-        tab = request.args.get("tab") or ("rows" if p else "flagged")
         rows = p.unresolved_rows() if p else []
-        unlinked = [by_id[i] for i in (p.unreferenced if p else []) if i in by_id]
-        # worst-first: hard flags & low confidence at the top
-        flagged = sorted(r.flagged(), key=lambda d: (d.confidence, -len(d.flags)))
+        bound = _bound_list(r, p)
 
+        active_tab = "bound" if request.args.get("tab") == "bound" else "rows"
         return render_template(
-            "review_list.html", tab=tab, plan=p,
-            counts=(p.counts() if p else None),
-            rows=rows, unlinked=unlinked, flagged=flagged, by_id=by_id,
+            "review_list.html", plan=p,
+            counts=(p.counts() if p else None), rows=rows, bound=bound,
+            active_tab=active_tab,
+            skipped_suppliers=sorted(controller.store.skipped_suppliers())
+            if controller.store else [],
             total=len(r.documents), invoice_count=len(invoices),
             locked=_locked(), state=controller.run_state())
 
@@ -138,7 +184,9 @@ def create_app(controller: RunController) -> Flask:
         return render_template("doc_detail.html", d=d,
                                row=(p.by_doc.get(d.id) if p else None),
                                state=controller.run_state(), locked=_locked(),
-                               linked=request.args.get("linked"))
+                               linked=request.args.get("linked"),
+                               bad_fields=(request.args.get("bad_fields") or "").split(",")
+                               if request.args.get("bad_fields") else [])
 
     @app.route("/link/row/<int:row>")
     def link_row(row):
@@ -169,9 +217,13 @@ def create_app(controller: RunController) -> Flask:
 
         idx = index()
         folders = idx.suggest_folders(rm.supplier) if idx else []
+        # The next unresolved row after this one, so a reviewer working a long queue
+        # can move on without bouncing back through the list between every row.
+        pending = sorted(x.row for x in p.unresolved_rows() if x.row != row)
+        next_row = next((n for n in pending if n > row), pending[0] if pending else None)
         return render_template("link_row.html", rm=rm, scored=scored,
                                folder_hints=folders, q=(request.args.get("q") or ""),
-                               state=controller.run_state())
+                               state=controller.run_state(), next_row=next_row)
 
     # ---- data / actions --------------------------------------------------
     @app.route("/status")
@@ -188,15 +240,13 @@ def create_app(controller: RunController) -> Flask:
         invoice = (data.get("invoice") or "").strip()
         gstr = (data.get("gstr") or "").strip() or None
         source_mode = (data.get("source_mode") or "local").strip()
-        upload_folder = (data.get("upload_folder") or "").strip() or None
         fy = (data.get("fy") or "").strip() or None     # "" = All years
         if not invoice:
-            where = ("Google Drive folder" if source_mode == "drive"
+            where = ("saved run folder" if source_mode == "continue"
                      else "invoice folder")
             return jsonify({"ok": False, "error": f"Choose the {where} first."}), 400
         partial_cache["size"] = -1          # a new run invalidates the cached ledger
-        res = controller.start(invoice, gstr, source_mode=source_mode,
-                               upload_folder_name=upload_folder, fy=fy)
+        res = controller.start(invoice, gstr, source_mode=source_mode, fy=fy)
         return jsonify(res), (200 if res.get("ok") else 400)
 
     @app.route("/api/years")
@@ -205,25 +255,36 @@ def create_app(controller: RunController) -> Flask:
 
         The client's returns arrive one workbook per financial year, so a run is
         scoped to one year; "All years" ("") still walks the whole tree. Only the
-        server can see the tree — local *or* Drive — so the list comes from here.
+        server can see the tree, so the list comes from here.
         """
         root = (request.args.get("root") or "").strip()
-        mode = (request.args.get("source_mode") or "local").strip()
         if not root:
             return jsonify({"ok": True, "years": []})
-        if mode == "drive":
-            if controller.drive is None:
-                return jsonify({"ok": False, "years": [],
-                                "error": "Connect Google Drive first."}), 400
-            from ..io.drive import folder_id_from
-            try:
-                years = controller.drive.list_fy_folders(folder_id_from(root))
-            except Exception as exc:
-                return jsonify({"ok": False, "years": [], "error": str(exc)}), 400
-            return jsonify({"ok": True, "years": years})
         from ..stages.walk import list_fy_folders
         return jsonify({"ok": True,
                         "years": list_fy_folders(Path(root).expanduser())})
+
+    @app.route("/api/run/inspect")
+    def api_run_inspect():
+        """Summarize a saved run folder for the "Continue a saved run" source mode:
+        the tree/year/GSTR it was scanned with, how many docs are already done, and
+        whether the original tree is still in place. Backs the form's detected panel.
+        """
+        d = (request.args.get("dir") or "").strip()
+        if not d:
+            return jsonify({"ok": False, "error": "Pick a run folder."}), 400
+        try:
+            store = RunStore.open_existing(d)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return jsonify({"ok": True, **store.describe()})
+
+    @app.route("/api/runs")
+    def api_runs():
+        """The most recent saved runs, for the "Continue a saved run" picker — so
+        picking one up again doesn't require already knowing/typing its path."""
+        return jsonify({"ok": True,
+                        "runs": RunStore.list_recent(controller.output_root)})
 
     @app.route("/api/pause", methods=["POST"])
     def api_pause():
@@ -240,29 +301,6 @@ def create_app(controller: RunController) -> Flask:
         """Stop the scan. Safe: the run stays resumable from its checkpoint."""
         res = controller.stop()
         return jsonify(res), (200 if res.get("ok") else 400)
-
-    @app.route("/api/drive/auth", methods=["POST"])
-    def api_drive_auth():
-        """Sign in to Google Drive (opens the system browser for consent)."""
-        res = controller.authenticate_drive()
-        return jsonify(res), (200 if res.get("ok") else 400)
-
-    @app.route("/api/drive/upload", methods=["POST"])
-    def api_drive_upload():
-        """Publish the master + detected invoices to a new Drive folder.
-
-        Backgrounded: it is one Drive round-trip per invoice, so on a real run this
-        takes minutes. The page polls /api/task for progress.
-        """
-        def job(progress) -> None:
-            rep = controller.upload_results(on_progress=progress)
-            # upload_results reports failure by returning, not raising — surface it as
-            # a failed task, or the UI would call a failed upload "done".
-            if not rep.get("ok"):
-                raise RuntimeError(rep.get("error") or "Upload failed.")
-
-        res = controller.start_task("upload", job)
-        return jsonify(res), (200 if res.get("ok") else 409)
 
     @app.route("/api/docs")
     def api_docs():
@@ -282,10 +320,69 @@ def create_app(controller: RunController) -> Flask:
             "folder": h.folder, "rel": h.rel, "score": h.score,
             "invoice_id": d.fields.invoice_id, "gstin": d.fields.vendor_gstin,
             "vendor": d.fields.vendor_name_pdf, "date": d.fields.invoice_date,
-            "company": d.path_info.company, "confidence": round(d.confidence, 2),
+            "amount": d.fields.total_value, "company": d.path_info.company,
+            "confidence": round(d.confidence, 2),
             "is_invoice": d.is_invoice, "doc_type": d.doc_type.value,
             "gstr_row": d.gstr_row,
         }
+
+    @app.route("/api/link/skip_supplier", methods=["POST"])
+    def skip_supplier():
+        """Skip (or un-skip) a supplier: its unmatched rows leave the queue and are
+        written SKIPPED on export. Re-runs the match so counts update immediately."""
+        if controller.store is None:
+            return jsonify({"ok": False, "error": "No run yet."}), 400
+        if _locked():
+            return jsonify({"ok": False, "error": "A scan or export is running."}), 409
+        data = request.get_json(silent=True) or request.form
+        name = (data.get("supplier") or "").strip()
+        on = str(data.get("on", "1")).lower() not in ("0", "false", "off", "")
+        if not name:
+            return jsonify({"ok": False, "error": "No supplier given."}), 400
+        with lock:
+            controller.store.set_skipped_supplier(name, on)
+            controller.rematch()
+            _persist(result())
+        p = plan()
+        return jsonify({
+            "ok": True, "supplier": name, "skipped": on,
+            "unresolved": len(p.unresolved_rows()) if p else 0,
+            "summary_html": str(_macro("review_summary")(p.counts() if p else None)),
+            "skipped_html": str(_macro("skipped_card")(
+                sorted(controller.store.skipped_suppliers()), _locked())),
+        })
+
+    @app.route("/api/link/mark_not_found", methods=["POST"])
+    def mark_not_found():
+        """Mark (or un-mark) a single B2B row as "searched by hand, no PDF exists".
+
+        It leaves the unmatched queue like a skip does, but is recorded per-row so the
+        export's Link Report and the bindings tab both show the reviewer *actively*
+        confirmed it missing — as opposed to the matcher merely failing to find it.
+        Re-runs the match so counts update immediately."""
+        if controller.store is None:
+            return jsonify({"ok": False, "error": "No run yet."}), 400
+        if _locked():
+            return jsonify({"ok": False, "error": "A scan or export is running."}), 409
+        data = request.get_json(silent=True) or request.form
+        try:
+            row = int(data.get("row"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "No row given."}), 400
+        on = str(data.get("on", "1")).lower() not in ("0", "false", "off", "")
+        with lock:
+            controller.store.set_manual_not_found(row, on)
+            controller.rematch()
+            _persist(result())
+        r, p = result(), plan()
+        bound = _bound_list(r, p)
+        return jsonify({
+            "ok": True, "row": row, "marked": on,
+            "unresolved": len(p.unresolved_rows()) if p else 0,
+            "summary_html": str(_macro("review_summary")(p.counts() if p else None)),
+            "bound_html": str(_macro("bound_pane")(bound, _locked())),
+            "bound_count": len(bound),
+        })
 
     @app.route("/api/link/search")
     def api_link_search():
@@ -315,17 +412,66 @@ def create_app(controller: RunController) -> Flask:
             "files": [_hit(h) for h in b["files"]],
         })
 
+    @app.route("/api/link/all")
+    def api_link_all():
+        """A flat, paginated list of *every* PDF in the run — the exhaustive
+        counterpart to the ranked fuzzy search. ``q`` filters by a plain
+        substring over each file's name, folder path and extracted text, so the
+        one box searches filename, path and content together.
+        """
+        idx = index()
+        if idx is None:
+            return jsonify({"files": [], "total": 0, "page": 1, "pages": 0,
+                            "page_size": 50})
+        q = (request.args.get("q") or "").strip()
+        try:
+            page = int(request.args.get("page", 1))
+        except (TypeError, ValueError):
+            page = 1
+        res = idx.flat(q, page=page, page_size=50)
+        return jsonify({
+            "q": q, "total": res["total"], "page": res["page"],
+            "pages": res["pages"], "page_size": res["page_size"],
+            "files": [_hit(h) for h in res["files"]],
+        })
+
     @app.route("/pdf/<doc_id>")
     def pdf(doc_id):
         """Serve a document's PDF, fetching it on demand if it wasn't pre-copied.
 
         The on-demand path is what lets a *stopped* run skip the bulk pre-copy of
-        flagged PDFs (the longest part of the shutdown on Drive) without costing
-        the reviewer anything.
+        flagged PDFs (the longest part of the shutdown) without costing the reviewer
+        anything.
         """
         d = doc_by_id(doc_id)
         if not d:
             abort(404)
+        # A page-invoice must show only its page. A pre-copied review_pdf_path is
+        # already sliced to one page; otherwise slice on demand from the source file
+        # (serving d.path directly would show the whole multi-invoice PDF).
+        if d.page_index is not None:
+            rp = d.review_pdf_path
+            if rp:
+                p = Path(rp)
+                if not p.is_absolute():
+                    p = (Path.cwd() / p).resolve()
+                if p.exists():
+                    return send_file(str(p), mimetype="application/pdf")
+            try:
+                local = controller.file_source.materialize(d)
+            except Exception:
+                abort(404)
+            import fitz
+            import io as _io
+            try:
+                with fitz.open(local) as s, fitz.open() as out:
+                    out.insert_pdf(s, from_page=d.page_index, to_page=d.page_index)
+                    data = out.tobytes()
+            except Exception:
+                abort(404)
+            finally:
+                controller.file_source.cleanup(d, local)
+            return send_file(_io.BytesIO(data), mimetype="application/pdf")
         for cand in (d.review_pdf_path, d.path):
             if not cand:
                 continue
@@ -343,6 +489,7 @@ def create_app(controller: RunController) -> Flask:
     _EDITABLE_FIELDS = ("invoice_id", "vendor_name_pdf", "vendor_gstin",
                         "invoice_date", "bill_to_name", "bill_to_gstin")
     _MONEY_FIELDS = ("taxable_value", "total_value")
+    _MONEY_LABELS = {"taxable_value": "taxable value", "total_value": "total value"}
 
     def _persist(r) -> None:
         # detections.json only — NOT the master workbook. The master is O(corpus) to
@@ -355,7 +502,7 @@ def create_app(controller: RunController) -> Flask:
         index_cache["gen"] += 1
 
     def _locked() -> bool:
-        """Review is read-only while a scan — or a long export/upload — is running.
+        """Review is read-only while a scan — or a long export — is running.
 
         Mid-scan you are looking at the live checkpoint, and `run_scan` rebuilds
         detections.json from that checkpoint when it finishes — so an edit made now
@@ -380,12 +527,16 @@ def create_app(controller: RunController) -> Flask:
             for k in _EDITABLE_FIELDS:
                 if k in form:
                     setattr(d.fields, k, form[k].strip() or None)
+            # A field that fails to parse must not vanish silently — it used to be
+            # dropped with `except ValueError: pass`, so a mistyped amount looked
+            # saved (the redirect succeeded) but the edit was quietly discarded.
+            bad_fields = []
             for k in _MONEY_FIELDS:
                 if k in form and form[k].strip():
                     try:
                         setattr(d.fields, k, round(float(form[k].replace(",", "")), 2))
                     except ValueError:
-                        pass
+                        bad_fields.append(k)
             d.reviewed = True
             record(d, "review", "confirmed", "human-confirmed via web UI")
             # Re-match immediately: correcting a GSTIN or an invoice number is
@@ -394,6 +545,10 @@ def create_app(controller: RunController) -> Flask:
             before = d.gstr_row
             controller.rematch()
             _persist(result())
+        if bad_fields:
+            labels = [_MONEY_LABELS.get(k, k) for k in bad_fields]
+            return redirect(url_for("doc_detail", doc_id=doc_id,
+                                    bad_fields=",".join(labels)))
         landed = d.gstr_row if d.gstr_row != before else None
         if landed:
             return redirect(url_for("doc_detail", doc_id=doc_id, linked=landed))
@@ -460,16 +615,19 @@ def create_app(controller: RunController) -> Flask:
             controller.store.set_manual_link(row, doc_id)
             controller.rematch()
             _persist(result())
-        return redirect(url_for("review", tab="rows"))
+        # Undo from the "My bindings" tab posts tab=bound so it lands back there;
+        # a fresh bind from the picker page falls back to the unmatched-rows tab.
+        return redirect(url_for("review", tab=request.form.get("tab", "rows")))
 
     @app.route("/finish", methods=["POST"])
     def finish():
         """Kick off the export on a background thread; the page polls /api/task.
 
-        This used to run inline. On a Drive run it downloads every matched invoice,
-        so the request could take *minutes* — the window sat frozen with no progress,
-        the user assumed nothing had happened, and every review edit blocked behind
-        the same write lock. Now it returns immediately and reports progress.
+        This used to run inline. write_linked copies every matched invoice and
+        rewrites the workbook, so the request could take seconds — the window sat
+        frozen with no progress, the user assumed nothing had happened, and every
+        review edit blocked behind the same write lock. Now it returns immediately
+        and reports progress.
         """
         r = result()
         if r is None or controller.store is None:
@@ -508,7 +666,7 @@ def create_app(controller: RunController) -> Flask:
 
     @app.route("/api/task")
     def api_task():
-        """Progress of the current long job (export / Drive upload)."""
+        """Progress of the current long job (the export)."""
         return jsonify(controller.task_state())
 
     @app.route("/api/open_output", methods=["POST"])
@@ -567,7 +725,7 @@ def serve(store: RunStore, port: int = 5000, open_browser: bool = True) -> None:
     controller.fy = store.fy()
     controller.last_input = {
         "invoice": meta.get("root", ""), "gstr": str(controller.gstr_path or ""),
-        "source_mode": "local", "upload_folder": "", "fy": controller.fy or "",
+        "source_mode": "local", "fy": controller.fy or "",
     }
 
     app = create_app(controller)
