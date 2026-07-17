@@ -170,7 +170,7 @@ class PathIndex:
         return out
 
     def search(self, q: str, limit: int = 20,
-               invoices_only: bool = False) -> list[Hit]:
+               invoices_only: bool = False, include_hidden: bool = False) -> list[Hit]:
         """Fuzzy-rank documents against a free-text path/field query, best first.
 
         A document scores the *mean* of how well it answers each word typed, with
@@ -194,6 +194,8 @@ class PathIndex:
         for i, total in totals.items():
             d = self.docs[i]
             if invoices_only and not d.is_invoice:
+                continue
+            if not include_hidden and d.hidden:
                 continue
             score = total / len(qts)
             if score < SCORE_CUTOFF:
@@ -222,7 +224,8 @@ class PathIndex:
             ]
         return self._content_hay
 
-    def flat(self, q: str = "", page: int = 1, page_size: int = 50) -> dict:
+    def flat(self, q: str = "", page: int = 1, page_size: int = 50,
+             include_hidden: bool = False) -> dict:
         """One page of *every* PDF in the run, filtered by a plain substring query.
 
         Unlike :meth:`search` this is exhaustive and paginated rather than a
@@ -232,11 +235,11 @@ class PathIndex:
         a filename, path *and* content search from one box.
         """
         terms = [t for t in q.lower().split() if t]
+        order = self._order if include_hidden else [
+            i for i in self._order if not self.docs[i].hidden]
         if terms:
             hay = self._content_haystacks()
-            order = [i for i in self._order if all(t in hay[i] for t in terms)]
-        else:
-            order = self._order
+            order = [i for i in order if all(t in hay[i] for t in terms)]
         total = len(order)
         page_size = max(1, page_size)
         pages = (total + page_size - 1) // page_size
@@ -249,7 +252,7 @@ class PathIndex:
         }
 
     # ---- browse ----------------------------------------------------------
-    def browse(self, prefix: Sequence[str] = ()) -> dict:
+    def browse(self, prefix: Sequence[str] = (), include_hidden: bool = False) -> dict:
         """One level of the original tree under ``prefix``.
 
         Returns the sub-folders (each with the number of PDFs *anywhere* beneath
@@ -262,6 +265,8 @@ class PathIndex:
         files: list[Hit] = []
 
         for d, rel in zip(self.docs, self.rel):
+            if not include_hidden and d.hidden:
+                continue
             if list(rel[:depth]) != pre:
                 continue
             rest = rel[depth:]

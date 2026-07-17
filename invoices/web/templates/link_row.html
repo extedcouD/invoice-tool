@@ -48,6 +48,10 @@
   <a href="#" data-mode="browse">Browse folders</a>
   <a href="#" data-mode="all">Browse PDFs</a>
 </div>
+<label class="muted" style="display:inline-flex;gap:6px;align-items:center;margin:10px 0 0"
+       title="PDFs you've hidden are left out of Search / Browse folders / Browse PDFs by default — check this to see them again and unhide">
+  <input type="checkbox" id="show-hidden"> show hidden PDFs
+</label>
 <div style="height:16px"></div>
 
 {# ---- 1 · field-based near-misses (GSTIN + invoice number) ----------------- #}
@@ -191,6 +195,18 @@
   const rowHtml = h => LINK.rowHtml(h, ROW);
   const table = hits => LINK.resultsTable(hits, ROW);
 
+  // ---- show/unhide hidden PDFs -------------------------------------------
+  // One toggle shared by the three finder tabs (near-matches only ever shows
+  // detected invoices, so hiding doesn't apply there). Re-runs whichever tab
+  // is currently open so the change is visible immediately.
+  const showHidden = $("#show-hidden");
+  const hiddenParam = () => showHidden.checked ? "&include_hidden=1" : "";
+  showHidden.onchange = () => {
+    if(!$("#pane-search").hidden) search(false);
+    if(!$("#pane-browse").hidden) browse(currentPrefix);
+    if(!$("#pane-all").hidden) loadAll(allPage);
+  };
+
   // ---- search + autocomplete --------------------------------------------
   const q = $("#q"), ac = $("#ac");
   let hits = [], sel = -1, timer = null;
@@ -224,7 +240,7 @@
     const s = q.value.trim();
     if(!s){ hits = []; ac.hidden = true; $("#search-results").innerHTML = ""; return; }
     let r;
-    try{ r = await fetch("/api/link/search?q=" + encodeURIComponent(s)).then(x => x.json()); }
+    try{ r = await fetch("/api/link/search?q=" + encodeURIComponent(s) + hiddenParam()).then(x => x.json()); }
     catch(e){
       // Say so. Swallowing this left the pane blank and the page looking broken.
       $("#search-results").innerHTML =
@@ -262,11 +278,13 @@
   // ---- folder navigation -------------------------------------------------
   const START = "{{ (folder_hints[0].path|join('/')) if folder_hints else '' }}";
   let browsed = false;
+  let currentPrefix = "";
 
   async function browse(prefix, highlight){
+    currentPrefix = prefix || "";
     let b;
     $("#browse-results").innerHTML = `<div class="card"><span class="spin"></span> Loading…</div>`;
-    try{ b = await fetch("/api/link/browse?prefix=" + encodeURIComponent(prefix || "")).then(x => x.json()); }
+    try{ b = await fetch("/api/link/browse?prefix=" + encodeURIComponent(prefix || "") + hiddenParam()).then(x => x.json()); }
     catch(e){
       $("#browse-results").innerHTML =
         `<div class="banner bad">Could not load that folder: ${esc(e)}</div>`;
@@ -313,7 +331,7 @@
     $("#all-results").innerHTML = `<div class="card"><span class="spin"></span> Loading…</div>`;
     $("#all-pager").innerHTML = "";
     let j;
-    try{ j = await fetch(`/api/link/all?page=${allPage}&q=` + encodeURIComponent(s)).then(x => x.json()); }
+    try{ j = await fetch(`/api/link/all?page=${allPage}&q=` + encodeURIComponent(s) + hiddenParam()).then(x => x.json()); }
     catch(e){ $("#all-results").innerHTML = `<div class="banner bad">Could not load PDFs: ${esc(e)}</div>`; return; }
     if(allQ.value.trim() !== s) return;          // a newer keystroke already won
     $("#all-results").innerHTML =
