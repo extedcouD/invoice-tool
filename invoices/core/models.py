@@ -122,6 +122,7 @@ class Document(BaseModel):
     reviewed: bool = False                    # a human confirmed/corrected this row
     review_pdf_path: Optional[str] = None     # copy placed in review folder, if flagged
     error: Optional[str] = None               # set if a stage hard-failed on this doc
+    hidden: bool = False                      # human-hidden from the link finder (search/browse)
 
     # ---- GSTR-2A linking ---------------------------------------------------
     # Stamped by `apply_plan` after every (re)match, so link state round-trips

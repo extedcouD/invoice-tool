@@ -48,6 +48,7 @@
   .bar.indet>span{width:35%!important;animation:slide 1.1s ease-in-out infinite}
   @keyframes slide{0%{margin-left:-35%}100%{margin-left:100%}}
   .muted{color:var(--mut)} .right{text-align:right}
+  tr.hidden-row td{opacity:.5}
   .btn{display:inline-block;background:var(--accent);color:#04131f;font-weight:700;
     border:none;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px}
   .btn.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
@@ -499,16 +500,19 @@ window.LINK = (function(){
     const taken = (h.gstr_row && h.gstr_row !== row)
       ? `<span class="pill info" title="already satisfies B2B row ${h.gstr_row}">row ${h.gstr_row}</span>` : "";
     const score = h.score ? `<span class="pill ${h.score>=85?"ok":h.score>=70?"warn":"info"}">${Math.round(h.score)}%</span>` : "";
-    return `<tr>
+    const hiddenPill = h.hidden ? `<span class="pill info">hidden</span>` : "";
+    return `<tr class="${h.hidden ? "hidden-row" : ""}">
       <td class="mono">${esc(h.invoice_id || h.filename)}<div class="muted" style="font-size:11.5px">${esc(h.folder || "—")}</div></td>
       <td class="mono muted">${esc(h.gstin || "—")}</td>
       <td class="muted">${esc(h.date || "—")}</td>
       <td class="mono muted right">${money(h.amount)}</td>
       <td class="muted">${esc(h.vendor || h.company || "—")}</td>
-      <td><span class="pill ${conf}">${h.confidence.toFixed(2)}</span> ${warn} ${taken}</td>
+      <td><span class="pill ${conf}">${h.confidence.toFixed(2)}</span> ${warn} ${taken} ${hiddenPill}</td>
       <td>${score}</td>
       <td class="right" style="white-space:nowrap">
         <button class="btn ghost sm" type="button" data-preview="${esc(h.id)}" data-label="${esc(h.invoice_id || h.filename)}">Preview</button>
+        <button class="btn ghost sm hide-toggle" type="button" data-doc-id="${esc(h.id)}"
+                data-hidden="${h.hidden ? "1" : "0"}">${h.hidden ? "Unhide" : "Hide"}</button>
         <form method="post" action="${bind}" style="display:inline" data-busy="Binding…"
               data-confirm="${h.is_invoice ? "" : esc(h.filename)}">
           <input type="hidden" name="doc_id" value="${esc(h.id)}">
@@ -516,6 +520,31 @@ window.LINK = (function(){
         </form>
       </td></tr>`;
   }
+
+  // Hide/unhide a PDF from the link finder (search/browse/content-search tabs).
+  // Doesn't touch the match or classification — purely search visibility — so a
+  // click just flips it and patches this one row, no reload, no rematch.
+  document.addEventListener("click", e => {
+    const b = e.target.closest && e.target.closest(".hide-toggle");
+    if(!b) return;
+    e.preventDefault();
+    const id = b.getAttribute("data-doc-id");
+    const on = b.getAttribute("data-hidden") !== "1";
+    const tr = b.closest("tr");
+    b.disabled = true;
+    fetch("/api/doc/" + encodeURIComponent(id) + "/hide", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({on})
+    }).then(r => r.json()).then(res => {
+      b.disabled = false;
+      if(!res.ok){ alert(res.error || "Could not update."); return; }
+      const showHidden = document.getElementById("show-hidden");
+      if(on && !(showHidden && showHidden.checked)){ tr.remove(); return; }
+      b.setAttribute("data-hidden", on ? "1" : "0");
+      b.textContent = on ? "Unhide" : "Hide";
+      tr.classList.toggle("hidden-row", on);
+    }).catch(e => { b.disabled = false; alert("Could not update: " + e); });
+  });
   const HEADER = `<tr><th>file / folder</th><th>GSTIN</th><th>date</th><th class="right">amount</th>
       <th>vendor</th><th>status</th><th>match</th><th></th></tr>`;
   function resultsTable(hits, row){

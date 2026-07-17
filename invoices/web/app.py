@@ -323,7 +323,7 @@ def create_app(controller: RunController) -> Flask:
             "amount": d.fields.total_value, "company": d.path_info.company,
             "confidence": round(d.confidence, 2),
             "is_invoice": d.is_invoice, "doc_type": d.doc_type.value,
-            "gstr_row": d.gstr_row,
+            "gstr_row": d.gstr_row, "hidden": d.hidden,
         }
 
     @app.route("/api/link/skip_supplier", methods=["POST"])
@@ -384,6 +384,36 @@ def create_app(controller: RunController) -> Flask:
             "bound_count": len(bound),
         })
 
+    def _include_hidden() -> bool:
+        return (request.args.get("include_hidden") or "") == "1"
+
+    @app.route("/api/doc/<doc_id>/hide", methods=["POST"])
+    def hide_doc(doc_id):
+        """Hide (or unhide) a PDF from the link finder's search/browse/content tabs.
+
+        Search and browse deliberately range over every PDF, including approvals
+        and junk (see `matching/paths.py`) — but that means the same junk resurfaces
+        on every later search. Hiding is purely a finder-visibility flag on the
+        Document; it must never touch classification or the match, so no
+        `controller.rematch()` here.
+        """
+        if controller.store is None:
+            return jsonify({"ok": False, "error": "No run yet."}), 400
+        if _locked():
+            return jsonify({"ok": False, "error": "A scan or export is running."}), 409
+        d = doc_by_id(doc_id)
+        if not d:
+            return jsonify({"ok": False, "error": "No such document."}), 404
+        data = request.get_json(silent=True) or request.form
+        on = str(data.get("on", "1")).lower() not in ("0", "false", "off", "")
+        with lock:
+            d.hidden = on
+            record(d, "review", "hidden" if on else "unhidden",
+                   "human hid this from the link finder" if on
+                   else "human unhid this in the link finder")
+            _persist(result())
+        return jsonify({"ok": True, "id": doc_id, "hidden": on})
+
     @app.route("/api/link/search")
     def api_link_search():
         """Typo-tolerant search over the original folder paths *and* the fields.
@@ -397,7 +427,8 @@ def create_app(controller: RunController) -> Flask:
         if idx is None:
             return jsonify({"hits": []})
         q = (request.args.get("q") or "").strip()
-        return jsonify({"q": q, "hits": [_hit(h) for h in idx.search(q, limit=20)]})
+        hits = idx.search(q, limit=20, include_hidden=_include_hidden())
+        return jsonify({"q": q, "hits": [_hit(h) for h in hits]})
 
     @app.route("/api/link/browse")
     def api_link_browse():
@@ -406,7 +437,7 @@ def create_app(controller: RunController) -> Flask:
         if idx is None:
             return jsonify({"folders": [], "files": [], "crumbs": [], "prefix": []})
         prefix = [p for p in (request.args.get("prefix") or "").split("/") if p]
-        b = idx.browse(prefix)
+        b = idx.browse(prefix, include_hidden=_include_hidden())
         return jsonify({
             "prefix": b["prefix"], "crumbs": b["crumbs"], "folders": b["folders"],
             "files": [_hit(h) for h in b["files"]],
@@ -428,7 +459,7 @@ def create_app(controller: RunController) -> Flask:
             page = int(request.args.get("page", 1))
         except (TypeError, ValueError):
             page = 1
-        res = idx.flat(q, page=page, page_size=50)
+        res = idx.flat(q, page=page, page_size=50, include_hidden=_include_hidden())
         return jsonify({
             "q": q, "total": res["total"], "page": res["page"],
             "pages": res["pages"], "page_size": res["page_size"],
