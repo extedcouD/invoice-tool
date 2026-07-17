@@ -279,7 +279,10 @@
 <div id="pdf-back" hidden></div>
 <div id="pdf-drawer" hidden>
   <div class="dh">
+    <button class="btn ghost sm" id="pdf-drawer-prev" type="button" title="Previous PDF (↑)">↑</button>
+    <button class="btn ghost sm" id="pdf-drawer-next" type="button" title="Next PDF (↓)">↓</button>
     <b id="pdf-drawer-title">Preview</b>
+    <button class="btn sm" id="pdf-drawer-bind" type="button" hidden>Bind to this row</button>
     <a class="btn ghost sm" id="pdf-drawer-open" target="_blank" rel="noopener">Open full ↗</a>
     <button class="btn ghost sm" id="pdf-drawer-close" type="button">Close ✕</button>
   </div>
@@ -468,20 +471,89 @@ window.LINK = (function(){
   const drawer = document.getElementById("pdf-drawer");
   const back = document.getElementById("pdf-back");
   const emb = document.getElementById("pdf-drawer-embed");
-  function openPreview(id, label){
+  const bindBtn = document.getElementById("pdf-drawer-bind");
+  const prevBtn = document.getElementById("pdf-drawer-prev");
+  const nextBtn = document.getElementById("pdf-drawer-next");
+  // The [data-preview] button behind the currently open preview — lets ↑/↓ and
+  // the drawer's own Bind button reach back into the row that opened it, without
+  // keeping a separate list of ids that would go stale the moment a search or
+  // page changes what's on screen.
+  let previewBtn = null;
+
+  // Every [data-preview] in the same table as `previewBtn`, in on-screen order —
+  // i.e. whatever list you're currently looking at (search hits, one browse
+  // folder, one page of Browse PDFs). Re-queried on every step so a table that
+  // re-rendered while the drawer was open (a new search landing, say) is picked
+  // up rather than navigating a stale list.
+  function previewList(){
+    const table = previewBtn && previewBtn.closest("table");
+    return table ? Array.from(table.querySelectorAll("[data-preview]")) : [];
+  }
+
+  // The row's actual Bind form, found by shape (a hidden doc_id input) rather
+  // than a fixed selector — the near-matches, search/browse/all and "my
+  // bindings" tabs all build this row differently, but only a bindable row
+  // (not an already-bound "Undo" row) carries this input.
+  function findBindForm(btn){
+    const tr = btn && btn.closest("tr");
+    if(!tr) return null;
+    for(const f of tr.querySelectorAll("form")){
+      if(f.querySelector('input[name="doc_id"]')) return f;
+    }
+    return null;
+  }
+
+  function refreshDrawerNav(){
+    const list = previewList();
+    const multi = list.length > 1;
+    prevBtn.hidden = nextBtn.hidden = !multi;
+    const form = findBindForm(previewBtn);
+    bindBtn.hidden = !form;
+    // Submitting the row's own <form> (rather than re-implementing bind here)
+    // means the drawer's button gets the exact same not-an-invoice confirm and
+    // busy-state handling as every other Bind button, for free.
+    bindBtn.onclick = form ? () => form.requestSubmit() : null;
+  }
+
+  function openPreview(id, label, btn){
+    if(btn) previewBtn = btn;
     document.getElementById("pdf-drawer-title").textContent = label || "Preview";
     document.getElementById("pdf-drawer-open").href = "/doc/" + encodeURIComponent(id);
     emb.setAttribute("src", "/pdf/" + encodeURIComponent(id));
     drawer.hidden = false; back.hidden = false;
+    refreshDrawerNav();
   }
-  function closePreview(){ drawer.hidden = true; back.hidden = true; emb.removeAttribute("src"); }
+  function closePreview(){
+    drawer.hidden = true; back.hidden = true; emb.removeAttribute("src");
+    previewBtn = null; bindBtn.hidden = true; bindBtn.onclick = null;
+  }
+  function stepPreview(dir){
+    const list = previewList();
+    if(!list.length) return;
+    let i = list.indexOf(previewBtn);
+    i = ((i === -1 ? 0 : i) + dir + list.length) % list.length;
+    const next = list[i];
+    next.scrollIntoView({block: "nearest"});
+    openPreview(next.getAttribute("data-preview"), next.getAttribute("data-label"), next);
+  }
   if(drawer){
     document.getElementById("pdf-drawer-close").onclick = closePreview;
     back.onclick = closePreview;
-    document.addEventListener("keydown", e => { if(e.key === "Escape" && !drawer.hidden) closePreview(); });
+    prevBtn.onclick = () => stepPreview(-1);
+    nextBtn.onclick = () => stepPreview(1);
+    document.addEventListener("keydown", e => {
+      if(drawer.hidden) return;
+      if(e.key === "Escape"){ closePreview(); return; }
+      // Don't steal arrow keys from a focused text input (e.g. the search box
+      // behind the drawer) — only navigate when nothing is being typed into.
+      const t = e.target && e.target.tagName;
+      if(t === "INPUT" || t === "TEXTAREA") return;
+      if(e.key === "ArrowDown"){ e.preventDefault(); stepPreview(1); }
+      else if(e.key === "ArrowUp"){ e.preventDefault(); stepPreview(-1); }
+    });
     document.addEventListener("click", e => {
       const b = e.target.closest && e.target.closest("[data-preview]");
-      if(b){ e.preventDefault(); openPreview(b.getAttribute("data-preview"), b.getAttribute("data-label")); }
+      if(b){ e.preventDefault(); openPreview(b.getAttribute("data-preview"), b.getAttribute("data-label"), b); }
     });
   }
 
