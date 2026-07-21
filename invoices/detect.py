@@ -249,6 +249,7 @@ def run_scan(root, out_root: Path, settings: Settings = DEFAULTS,
     if gstr_path is not None:
         phase("linking")
         try:
+            _backfill_from_linked_xlsx(result, gstr_path, store)
             link_now(result, gstr_path, store)
             store.update_meta(link_error=None)
         except Exception as exc:   # a bad workbook must not sink a good scan
@@ -287,6 +288,70 @@ def link_now(result: RunResult, gstr_path: Path, store: RunStore,
     apply_plan(result, plan)
     store.save_link(plan)
     return plan
+
+
+def _backfill_from_linked_xlsx(result: RunResult, gstr_path: Path, store: RunStore) -> int:
+    """Recover a match an earlier ``_linked.xlsx`` export shows but the run's own
+    state currently doesn't.
+
+    The exported "Invoice Ref" cell is not the PDF's filename, id, or path — it's a
+    synthesized ``<GSTIN>__<invoice-no>.pdf`` built from the row's *own* columns
+    (`io/gstr.py::_flat_name`), which we already have from the template itself. So
+    it adds exactly one fact: this row was matched before. It never says which
+    Document satisfied it, so recovery can't look the doc up by that cell — instead,
+    for a row we currently can't resolve but the export shows as matched, retry
+    matching that one row against *every* Document, not just `result.invoices()`.
+    This recovers the dominant failure mode: a `bind_row` promotion reverting
+    (`doc_type` flips back, so the doc drops out of `invoices()` even though its
+    GSTIN/invoice-number fields are untouched). It can't recover a *field*
+    correction reverting — the export never stored the doc's fields, only the
+    row's, so there's nothing left to recover that from.
+
+    Read-only over the exported workbook; never overrides a link the current state
+    already has. Called once per scan/continue from `run_scan` only — never from
+    the interactive `rematch()` (web/runner.py) — so it can't fight a reviewer's
+    own undo of a link the export hasn't caught up with yet.
+    """
+    from .io.gstr import AMBIGUOUS, MATCHED, NOT_FOUND, match, read_b2b_rows
+
+    try:
+        kept = _keep_gstr_with_run(Path(gstr_path), store)
+        linked_path = store.gstr_linked_path(kept)
+        if not linked_path.exists():
+            return 0
+        rows = read_b2b_rows(kept)
+        linked_by_row = {r.row: r for r in read_b2b_rows(linked_path)}
+    except Exception:
+        return 0   # a bad/partial workbook must not sink the scan
+
+    manual = store.manual_links()
+    baseline = match(rows, result.invoices(), manual,
+                     skipped=store.skipped_suppliers(),
+                     not_found_rows=store.manual_not_found())
+    rows_by_row = {r.row: r for r in rows}
+
+    recovered = 0
+    for rm in baseline.rows:
+        if rm.status not in (NOT_FOUND, AMBIGUOUS) or rm.row in manual:
+            continue                          # already fine, or a human already decided
+        prior = linked_by_row.get(rm.row)
+        if not prior or not prior.existing_ref:
+            continue                          # wasn't matched in the earlier export either
+        retry = match([rows_by_row[rm.row]], result.documents)   # widen: ALL docs
+        hit = retry.rows[0] if retry.rows else None
+        if not (hit and hit.status == MATCHED and hit.doc_id):
+            continue
+        doc = next((d for d in result.documents if d.id == hit.doc_id), None)
+        if doc is None:
+            continue
+        if not doc.is_invoice:
+            doc.doc_type = DocType.INVOICE
+            record(doc, "review", "recovered",
+                   f"re-linked to B2B row {rm.row} from a previous export — "
+                   "the run's own state no longer had this match", severity="warn")
+        store.set_manual_link(rm.row, doc.id)
+        recovered += 1
+    return recovered
 
 
 def _keep_gstr_with_run(gstr_path: Path, store: RunStore) -> Path:
