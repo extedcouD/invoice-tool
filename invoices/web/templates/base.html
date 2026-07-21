@@ -159,6 +159,8 @@
     <a href="{{ url_for('review') }}" class="{{ 'on' if request.endpoint in ('review','doc_detail','link_row') }}">Review queue</a>
     <a href="{{ url_for('dashboard') }}" class="{{ 'on' if request.endpoint == 'dashboard' }}">Dashboard</a>
   </nav>
+  <button class="btn ghost sm" id="save-now" type="button" hidden
+          title="Every edit already saves itself the moment you make it — this just gives you an on-screen confirmation, on demand">💾 Save</button>
 </header>
 
 <!-- Live run bar. Present on every page except home (which has the full live
@@ -393,6 +395,29 @@ window.UI = (function(){
     const b = e.target.closest && e.target.closest("[data-open-output]");
     if(b){ e.preventDefault(); openOutput(b); }
   });
+
+  // Manual "Save now". Every review edit already persists itself the instant
+  // it happens (see `_persist` in web/app.py) — there is no unsaved draft
+  // sitting in memory — but a reviewer still wants a button they can hit for an
+  // explicit, on-screen "yes, that's on disk" rather than trusting it silently
+  // happened. Shown only once a run actually exists to save.
+  const saveBtn = document.getElementById("save-now");
+  if(saveBtn){
+    fetch("/run_state").then(r => r.json()).then(s => {
+      saveBtn.hidden = !s.has_result;
+    }).catch(() => {});
+    saveBtn.onclick = async () => {
+      const restore = busy(saveBtn, "Saving…");
+      let r;
+      try{ r = await fetch("/api/save", {method: "POST"}).then(x => x.json()); }
+      catch(e){ restore(); alert("Could not save: " + e); return; }
+      restore();
+      if(!r.ok){ alert(r.error || "Could not save."); return; }
+      const html = saveBtn.innerHTML;
+      saveBtn.innerHTML = "✓ Saved";
+      setTimeout(() => { saveBtn.innerHTML = html; }, 1200);
+    };
+  }
 
   // A heavier confirm() — for the one truly irreversible action (Finish & export),
   // which used to get the exact same plain browser confirm() as a reversible click

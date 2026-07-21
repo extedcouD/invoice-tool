@@ -544,6 +544,27 @@ def create_app(controller: RunController) -> Flask:
         """
         return controller.busy or controller.task_running
 
+    @app.route("/api/save", methods=["POST"])
+    def api_save():
+        """Explicit "save now". Every review edit already persists itself the
+        moment it happens (`_persist`, above) — this exists so a reviewer can get
+        an on-demand, on-screen confirmation that their work is on disk, rather
+        than having to trust that silently happened after each click. Handy after
+        a run of edits, and before doing anything that feels risky (like
+        continuing the run with newly-added PDFs).
+        """
+        if controller.store is None:
+            return jsonify({"ok": False, "error": "No run yet."}), 400
+        if _locked():
+            return jsonify({"ok": False, "error": "A scan or export is running — "
+                            "your edits are already being saved as they happen."}), 409
+        r = result()
+        if r is None:
+            return jsonify({"ok": False, "error": "Nothing to save yet."}), 400
+        with lock:
+            _persist(r)
+        return jsonify({"ok": True})
+
     @app.route("/doc/<doc_id>/confirm", methods=["POST"])
     def confirm(doc_id):
         d = doc_by_id(doc_id)
