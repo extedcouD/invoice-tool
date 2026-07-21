@@ -95,6 +95,30 @@ def _flag_duplicate_ids(result: RunResult) -> None:
                        f"{inv_id} x{len(docs)}", severity="warn")
 
 
+def _assemble_documents(store: RunStore) -> list[Document]:
+    """Merge the checkpoint ledger with the run's last-saved review state.
+
+    ``checkpoint.jsonl`` only ever holds each document's *pre-review* pipeline
+    output — nothing re-appends to it after a human edits/promotes/rejects a doc
+    via the review UI (those edits land in detections.json only, via `_persist`).
+    A continued/resumed run used to rebuild `documents` from the ledger alone,
+    which silently reverted every review edit — and, with it, everything the
+    matcher had resolved because of one (a promoted doc drops back out of
+    `invoices()`, a corrected GSTIN/invoice number re-indexes under its original
+    mis-OCR'd key). Anything already present in the last-saved result keeps that
+    saved state; only source_keys not seen before come from the ledger.
+    """
+    fresh = store.checkpoint_docs()
+    if not store.detections_path.exists():
+        return fresh
+    try:
+        prior = store.load()
+    except Exception:
+        return fresh   # corrupt/unreadable — fall back to the old (safe) behavior
+    known = {d.source_key for d in prior.documents if d.source_key}
+    return list(prior.documents) + [d for d in fresh if d.source_key not in known]
+
+
 def _copy_one_flagged(d: Document, store: RunStore, file_source: FileSource) -> None:
     dest = store.review_dir / f"{d.id}__{d.filename}"
     try:
@@ -197,10 +221,12 @@ def run_scan(root, out_root: Path, settings: Settings = DEFAULTS,
                  on_doc_done=store.append_checkpoint,
                  skip_keys=store.done_keys())          # empty for a fresh run
 
-    # Assemble from the durable ledger (already-done + this batch), so a resumed
-    # run yields the same complete corpus as an uninterrupted one.
+    # Assemble from the durable ledger (already-done + this batch), overlaid with
+    # whatever was already reviewed and saved (see _assemble_documents) — so a
+    # resumed/continued run yields the same complete corpus as an uninterrupted
+    # one AND keeps every review edit made since the run last finished.
     phase("finishing")
-    documents = store.checkpoint_docs()
+    documents = _assemble_documents(store)
     documents.sort(key=lambda d: d.path)   # deterministic regardless of completion order
 
     # Complete iff we actually reached the end of the tree. This is the single
